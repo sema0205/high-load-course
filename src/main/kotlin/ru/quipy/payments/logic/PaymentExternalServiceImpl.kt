@@ -12,6 +12,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -37,6 +38,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
+    // Добавляем sliding window rate limiter на основе параметров аккаунта
     private val rateLimiter = SlidingWindowRateLimiter(
         rateLimitPerSec.toLong(),
         requestAverageProcessingTime
@@ -45,10 +47,8 @@ class PaymentExternalSystemAdapterImpl(
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
-        if (!rateLimiter.tick()) {
-            logger.warn("[$accountName] Rate limit exceeded for payment $paymentId")
-            return
-        }
+        // Ждем разрешения от rate limiter (блокирующий вызов)
+        rateLimiter.tickBlocking()
 
         val transactionId = UUID.randomUUID()
 
