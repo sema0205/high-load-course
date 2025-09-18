@@ -6,11 +6,13 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 
 // Advice: always treat time as a Duration
@@ -36,8 +38,17 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder().build()
 
+    // Добавляем sliding window rate limiter на основе параметров аккаунта
+    private val rateLimiter = SlidingWindowRateLimiter(
+        rateLimitPerSec.toLong(),
+        Duration.ofSeconds(1)
+    )
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+
+        // Ждем разрешения от rate limiter (блокирующий вызов)
+        rateLimiter.tickBlocking()
 
         val transactionId = UUID.randomUUID()
 
@@ -60,7 +71,7 @@ class PaymentExternalSystemAdapterImpl(
                     mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                 } catch (e: Exception) {
                     logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                    ExternalSysResponse(transactionId.toString(), paymentId.toString(),false, e.message)
+                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                 }
 
                 logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
