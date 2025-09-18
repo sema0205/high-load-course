@@ -41,7 +41,7 @@ class PaymentExternalSystemAdapterImpl(
     // Добавляем sliding window rate limiter на основе параметров аккаунта
     private val rateLimiter = SlidingWindowRateLimiter(
         rateLimitPerSec.toLong(),
-        requestAverageProcessingTime
+        Duration.ofSeconds(1)
     )
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
