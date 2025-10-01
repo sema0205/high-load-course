@@ -2,6 +2,8 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.MeterRegistry
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -22,6 +24,7 @@ class PaymentExternalSystemAdapterImpl(
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
     private val paymentProviderHostPort: String,
     private val token: String,
+    private val meterRegistry: MeterRegistry,
 ) : PaymentExternalSystemAdapter {
 
     companion object {
@@ -30,6 +33,10 @@ class PaymentExternalSystemAdapterImpl(
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
     }
+
+    private val requestCounter = Counter.builder("http_shop_payment_requests")
+        .description("Total number of requests sent by shop to payment service")
+        .register(meterRegistry)
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
@@ -55,6 +62,8 @@ class PaymentExternalSystemAdapterImpl(
 
         // Ждем разрешения от rate limiter (блокирующий вызов)
         rateLimiter.tickBlocking()
+
+        requestCounter.increment()
 
         val transactionId = UUID.randomUUID()
 
