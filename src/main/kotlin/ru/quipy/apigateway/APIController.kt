@@ -5,6 +5,8 @@ import io.micrometer.core.instrument.MeterRegistry
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.http.HttpStatus
+import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
@@ -63,7 +65,10 @@ class APIController(private val meterRegistry: MeterRegistry) {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): PaymentSubmissionDto {
+    fun payOrder(
+        @PathVariable orderId: UUID,
+        @RequestParam deadline: Long
+    ): ResponseEntity<PaymentSubmissionDto> {
         requestCounter.increment()
 
         val paymentId = UUID.randomUUID()
@@ -72,9 +77,13 @@ class APIController(private val meterRegistry: MeterRegistry) {
             it
         } ?: throw IllegalArgumentException("No such order $orderId")
 
+        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline) ?: return ResponseEntity
+            .status(HttpStatus.TOO_MANY_REQUESTS)
+            .header("Retry-After", "1")
+            .build()
 
-        val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-        return PaymentSubmissionDto(createdAt, paymentId)
+        return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
+
     }
 
     class PaymentSubmissionDto(
