@@ -29,7 +29,7 @@ class OrderPayer {
     private var rateLimiter: LeakingBucketRateLimiter = LeakingBucketRateLimiter(
         11,
         window = Duration.ofSeconds(1),
-        bucketSize = 143,
+        bucketSize = 286,
     )
 
     private val paymentExecutor = ThreadPoolExecutor(
