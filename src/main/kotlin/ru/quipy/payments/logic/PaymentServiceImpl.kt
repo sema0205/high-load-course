@@ -21,9 +21,13 @@ class PaymentSystemImpl(
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
     }
 
-    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) : Boolean {
+        var requestRetriable = false;
         for (account in paymentAccounts) {
-            account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
+            val retriable = account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
+            requestRetriable = requestRetriable || retriable
         }
+
+        return requestRetriable
     }
 }

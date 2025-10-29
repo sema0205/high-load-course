@@ -27,9 +27,9 @@ class OrderPayer {
     private lateinit var paymentService: PaymentService
 
     private var rateLimiter: LeakingBucketRateLimiter = LeakingBucketRateLimiter(
-        11,
+        10,
         window = Duration.ofSeconds(1),
-        bucketSize = 270,
+        bucketSize = 30,
     )
 
     private val paymentExecutor = ThreadPoolExecutor(
@@ -47,6 +47,7 @@ class OrderPayer {
             return null
         }
 
+        var requestRetriable = false;
         val createdAt = System.currentTimeMillis()
         paymentExecutor.submit {
             val createdEvent = paymentESService.create {
@@ -58,8 +59,13 @@ class OrderPayer {
             }
             logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
-            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+            requestRetriable = paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
+
+        if (requestRetriable) {
+            return null
+        }
+
         return createdAt
     }
 }

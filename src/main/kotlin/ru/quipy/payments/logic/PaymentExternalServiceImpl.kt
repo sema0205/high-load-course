@@ -54,7 +54,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val semaphore = Semaphore(parallelRequests, true)
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) : Boolean {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         // Semaphore — ограничиваем параллелизм
@@ -74,6 +74,8 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+
+        var requestRetriable = false
 
         try {
             val request = Request.Builder().run {
@@ -95,6 +97,10 @@ class PaymentExternalSystemAdapterImpl(
                 // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
                 paymentESService.update(paymentId) {
                     it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                }
+
+                if (!body.result && body.message == "Temporary error") {
+                    requestRetriable = true;
                 }
             }
         } catch (e: Exception) {
@@ -118,6 +124,8 @@ class PaymentExternalSystemAdapterImpl(
             // Освобождаем симафор
             semaphore.release()
         }
+
+        return requestRetriable
     }
 
     override fun price() = properties.price
