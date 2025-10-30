@@ -4,10 +4,10 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
-import ru.quipy.common.utils.*
+import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
+import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
@@ -26,11 +26,6 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    private var rateLimiter: LeakingBucketRateLimiter = LeakingBucketRateLimiter(
-        10,
-        window = Duration.ofSeconds(1),
-        bucketSize = 30,
-    )
 
     private val paymentExecutor = ThreadPoolExecutor(
         16,
@@ -42,12 +37,7 @@ class OrderPayer {
         CallerBlockingRejectedExecutionHandler()
     )
 
-    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
-        if (!rateLimiter.tick()) {
-            return null
-        }
-
-        var requestRetriable = false;
+    fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long {
         val createdAt = System.currentTimeMillis()
         paymentExecutor.submit {
             val createdEvent = paymentESService.create {
@@ -59,13 +49,8 @@ class OrderPayer {
             }
             logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
-            requestRetriable = paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+            paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
         }
-
-        if (requestRetriable) {
-            return null
-        }
-
         return createdAt
     }
 }
