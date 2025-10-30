@@ -79,7 +79,7 @@ class APIController(private val meterRegistry: MeterRegistry) {
 
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline) ?: return ResponseEntity
             .status(HttpStatus.TOO_MANY_REQUESTS)
-            .header("Retry-After", "30")
+            .header("Retry-After", "2")
             .build()
 
         return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
