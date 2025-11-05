@@ -3,6 +3,7 @@ package ru.quipy.payments.logic
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.DistributionSummary
 import io.micrometer.core.instrument.MeterRegistry
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -34,7 +35,7 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
 
         // Настройки retry
-        const val MAX_ATTEMPTS = 2
+        const val MAX_ATTEMPTS = 4
         const val RETRY_DELAY_MS = 1000L
         const val TEMPORARY_ERROR = "Temporary error"
     }
@@ -61,6 +62,8 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+
+        val requestStartTime = System.currentTimeMillis()
 
         // Semaphore — ограничиваем параллелизм
         semaphore.acquire()
@@ -95,6 +98,7 @@ class PaymentExternalSystemAdapterImpl(
                 val request = Request.Builder().run {
                     url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                     post(emptyBody)
+                        .header("deadline", deadline.toString())
                 }.build()
 
                 client.newCall(request).execute().use { response ->
@@ -106,6 +110,14 @@ class PaymentExternalSystemAdapterImpl(
                     }
 
                     logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, attempt ${attempt + 1}, succeeded: ${body.result}, message: ${body.message}")
+
+                    val requestDuration = System.currentTimeMillis() - requestStartTime
+                    DistributionSummary.builder("payment_request_duration")
+                        .description("Payment request duration with status code")
+                        .tags("status_code", response.code.toString())
+                        .publishPercentiles(0.5, 0.8, 0.99)
+                        .register(meterRegistry)
+                        .record(requestDuration.toDouble())
 
                     // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
                     // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
