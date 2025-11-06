@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Timer
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -33,14 +34,22 @@ class PaymentExternalSystemAdapterImpl(
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
 
-        // Настройки retry
-        const val MAX_ATTEMPTS = 2
-        const val RETRY_DELAY_MS = 1000L
+        const val MAX_ATTEMPTS = 3
+        const val RETRY_DELAY_MS = 300L
         const val TEMPORARY_ERROR = "Temporary error"
     }
 
     private val requestCounter = Counter.builder("http_shop_payment_requests")
         .description("Total number of requests sent by shop to payment service")
+        .register(meterRegistry)
+
+    private val retryCounter = Counter.builder("payment_retry_count")
+        .description("Number of payment retries")
+        .register(meterRegistry)
+
+    private val requestLatency = Timer.builder("payment_request_latency")
+        .description("Payment request latency with quantiles")
+        .publishPercentiles(0.5, 0.85, 0.99)
         .register(meterRegistry)
 
     private val serviceName = properties.serviceName
@@ -49,7 +58,9 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .readTimeout(Duration.ofMillis(1800))
+        .build()
 
     // Добавляем sliding window rate limiter на основе параметров аккаунта
     private val rateLimiter = SlidingWindowRateLimiter(
@@ -61,6 +72,8 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+
+        val requestStartTime = System.currentTimeMillis()
 
         // Semaphore — ограничиваем параллелизм
         semaphore.acquire()
@@ -80,9 +93,7 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-        // Retry loop: максимум 2 попытки
         for (attempt in 0 until MAX_ATTEMPTS) {
-            // Проверяем deadline перед попыткой
             if (now() >= deadline) {
                 logger.error("[$accountName] Deadline exceeded before attempt ${attempt + 1} for payment $paymentId")
                 paymentESService.update(paymentId) {
@@ -107,8 +118,6 @@ class PaymentExternalSystemAdapterImpl(
 
                     logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, attempt ${attempt + 1}, succeeded: ${body.result}, message: ${body.message}")
 
-                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
                     if (body.result) {
                         // Успех - завершаем
                         paymentESService.update(paymentId) {
@@ -120,8 +129,9 @@ class PaymentExternalSystemAdapterImpl(
                         val timeForRetry = now() + RETRY_DELAY_MS + requestAverageProcessingTime.toMillis()
                         if (timeForRetry < deadline) {
                             logger.warn("[$accountName] Temporary error for payment $paymentId, retrying after $RETRY_DELAY_MS ms")
+                            retryCounter.increment()
                             Thread.sleep(RETRY_DELAY_MS)
-                            continue // следующая попытка
+                            continue
                         } else {
                             logger.error("[$accountName] Not enough time for retry, deadline too close")
                             paymentESService.update(paymentId) {
@@ -146,10 +156,25 @@ class PaymentExternalSystemAdapterImpl(
             } catch (e: Exception) {
                 when (e) {
                     is SocketTimeoutException -> {
-                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
+                        logger.error(
+                            "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId, attempt ${attempt + 1}",
+                            e
+                        )
+
+                        if (attempt < MAX_ATTEMPTS - 1) {
+                            val timeForRetry = now() + RETRY_DELAY_MS + requestAverageProcessingTime.toMillis()
+                            if (timeForRetry < deadline) {
+                                logger.warn("[$accountName] SocketTimeout for payment $paymentId, retrying after $RETRY_DELAY_MS ms")
+                                retryCounter.increment()
+                                Thread.sleep(RETRY_DELAY_MS)
+                                continue
+                            }
+                        }
+
                         paymentESService.update(paymentId) {
                             it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
                         }
+                        break
                     }
 
                     else -> {
@@ -158,13 +183,15 @@ class PaymentExternalSystemAdapterImpl(
                         paymentESService.update(paymentId) {
                             it.logProcessing(false, now(), transactionId, reason = e.message)
                         }
+                        break
                     }
                 }
-                break // Не ретраим при исключениях
             }
         }
 
-        // Освобождаем симафор
+        val requestFinishTime = System.currentTimeMillis()
+        requestLatency.record(requestFinishTime - requestStartTime, TimeUnit.MILLISECONDS)
+
         semaphore.release()
     }
 
