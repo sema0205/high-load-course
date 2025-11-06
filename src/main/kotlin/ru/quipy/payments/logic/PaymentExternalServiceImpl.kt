@@ -36,7 +36,7 @@ class PaymentExternalSystemAdapterImpl(
 
         // Настройки retry
         const val MAX_ATTEMPTS = 4
-        const val RETRY_DELAY_MS = 1000L
+        const val RETRY_DELAY_MS = 100L
         const val TEMPORARY_ERROR = "Temporary error"
     }
 
@@ -49,9 +49,10 @@ class PaymentExternalSystemAdapterImpl(
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
+    private val timeout = Duration.ofMillis(3000)
 
     private val client = OkHttpClient.Builder()
-        .callTimeout(Duration.ofMillis(1500))
+        .readTimeout(timeout)
         .build()
 
     // Добавляем sliding window rate limiter на основе параметров аккаунта
@@ -97,10 +98,10 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             try {
+                val serverTimeout = timeout.minus(Duration.ofSeconds(1))
                 val request = Request.Builder().run {
-                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=$serverTimeout")
                     post(emptyBody)
-                        .header("deadline", deadline.toString())
                 }.build()
 
                 client.newCall(request).execute().use { response ->
