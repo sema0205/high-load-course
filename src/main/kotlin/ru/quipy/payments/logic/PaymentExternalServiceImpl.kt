@@ -36,7 +36,7 @@ class PaymentExternalSystemAdapterImpl(
 
         // Настройки retry
         const val MAX_ATTEMPTS = 4
-        const val RETRY_DELAY_MS = 100L
+        const val RETRY_DELAY_MS = 10L
         const val TEMPORARY_ERROR = "Temporary error"
     }
 
