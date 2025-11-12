@@ -59,7 +59,7 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val client = OkHttpClient.Builder()
-        .readTimeout(Duration.ofMillis(1800))
+        .callTimeout(Duration.ofMillis(1500))
         .build()
 
     // Добавляем sliding window rate limiter на основе параметров аккаунта
@@ -104,7 +104,7 @@ class PaymentExternalSystemAdapterImpl(
 
             try {
                 val request = Request.Builder().run {
-                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=${Duration.ofMillis(1500)}")
                     post(emptyBody)
                 }.build()
 
