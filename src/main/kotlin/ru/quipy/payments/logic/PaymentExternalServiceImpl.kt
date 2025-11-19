@@ -35,7 +35,6 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
 
         const val MAX_ATTEMPTS = 3
-        const val RETRY_DELAY_MS = 300L
         const val TEMPORARY_ERROR = "Temporary error"
     }
 
@@ -52,7 +51,6 @@ class PaymentExternalSystemAdapterImpl(
         .publishPercentiles(0.5, 0.85, 0.99)
         .register(meterRegistry)
 
-    private val scheduler = Executors.newScheduledThreadPool(5)
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val requestAverageProcessingTime = properties.averageProcessingTime
@@ -115,7 +113,7 @@ class PaymentExternalSystemAdapterImpl(
         requestStartTime: Long
     ) {
         if (now() >= deadline) {
-            logger.error("[$accountName] Deadline exceeded before attempt ${attempt + 1} for payment $paymentId")
+            logger.error("[$accountName] Deadline exceeded before attempt ${attempt} for payment $paymentId")
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
             }
@@ -149,7 +147,7 @@ class PaymentExternalSystemAdapterImpl(
                             }
 
                             completeRequest(requestStartTime)
-                        } else if (body.message == TEMPORARY_ERROR && attempt < MAX_ATTEMPTS - 1) {
+                        } else if (body.message == TEMPORARY_ERROR) {
                             // Временная ошибка - retry если есть время
                             handleRetryableRequestError(
                                 paymentId,
@@ -228,25 +226,21 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        val timeForRetry = now() + RETRY_DELAY_MS + requestAverageProcessingTime.toMillis()
+        val timeForRetry = now() + requestAverageProcessingTime.toMillis()
 
         if (timeForRetry < deadline) {
-            logger.warn("[$accountName] SocketTimeout for payment $paymentId, retrying after $RETRY_DELAY_MS ms")
+            logger.warn("[$accountName] SocketTimeout for payment $paymentId, retrying")
             retryCounter.increment()
 
-            scheduler.schedule({
-                executePaymentRequestAsync(
-                        paymentId = paymentId,
-                        amount = amount,
-                        paymentStartedAt = paymentStartedAt,
-                        deadline = deadline,
-                        attempt = nextAttempt,
-                        transactionId = transactionId,
-                        requestStartTime = requestStartTime
-                )
-            },
-                RETRY_DELAY_MS,
-                TimeUnit.MILLISECONDS)
+            executePaymentRequestAsync(
+                    paymentId = paymentId,
+                    amount = amount,
+                    paymentStartedAt = paymentStartedAt,
+                    deadline = deadline,
+                    attempt = nextAttempt,
+                    transactionId = transactionId,
+                    requestStartTime = requestStartTime
+            )
         } else {
             logger.error("[$accountName] Not enough time for retry, deadline too close")
             paymentESService.update(paymentId) {
