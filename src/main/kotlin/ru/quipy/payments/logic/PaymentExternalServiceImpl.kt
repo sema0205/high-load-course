@@ -59,6 +59,11 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder()
         .callTimeout(Duration.ofMillis(20000))
+        .dispatcher(Dispatcher().apply {
+            maxRequests = parallelRequests
+            maxRequestsPerHost = parallelRequests
+        })
+        .connectionPool(ConnectionPool(5000, 30, TimeUnit.SECONDS))
         .build()
 
     // Добавляем sliding window rate limiter на основе параметров аккаунта
@@ -176,7 +181,7 @@ class PaymentExternalSystemAdapterImpl(
             override fun onFailure(call: Call, e: IOException) {
                 if (e is SocketTimeoutException) {
                     logger.error(
-                        "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId, attempt ${attempt + 1}",
+                        "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId, attempt ${attempt}",
                         e
                     )
 
@@ -229,7 +234,7 @@ class PaymentExternalSystemAdapterImpl(
         val timeForRetry = now() + requestAverageProcessingTime.toMillis()
 
         if (timeForRetry < deadline) {
-            logger.warn("[$accountName] SocketTimeout for payment $paymentId, retrying")
+            logger.warn("[$accountName] Temporary error for payment $paymentId, retrying")
             retryCounter.increment()
 
             executePaymentRequestAsync(
