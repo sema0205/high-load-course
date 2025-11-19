@@ -63,7 +63,7 @@ class PaymentExternalSystemAdapterImpl(
             maxRequests = parallelRequests
             maxRequestsPerHost = parallelRequests
         })
-        .connectionPool(ConnectionPool(5000, 30, TimeUnit.SECONDS))
+        .connectionPool(ConnectionPool(parallelRequests, 30, TimeUnit.SECONDS))
         .build()
 
     // Добавляем sliding window rate limiter на основе параметров аккаунта
