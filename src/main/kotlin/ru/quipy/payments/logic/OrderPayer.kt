@@ -26,6 +26,12 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
+    private var rateLimiter: LeakingBucketRateLimiter = LeakingBucketRateLimiter(
+        1000,
+        window = Duration.ofSeconds(1),
+        bucketSize = 3000,
+    )
+
     private val paymentExecutor = ThreadPoolExecutor(
         20000,
         20000,
@@ -37,6 +43,9 @@ class OrderPayer {
     )
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
+        if (!rateLimiter.tick()) {
+            return null
+        }
 
         val createdAt = System.currentTimeMillis()
         paymentExecutor.submit(
