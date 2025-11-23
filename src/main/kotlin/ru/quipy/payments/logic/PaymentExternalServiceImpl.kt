@@ -62,10 +62,10 @@ class PaymentExternalSystemAdapterImpl(
         .readTimeout(Duration.ofMillis(30000))
         .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
         .dispatcher(Dispatcher().apply {
-            maxRequests = 2000
-            maxRequestsPerHost = 1000
+            maxRequests = 20000
+            maxRequestsPerHost = 10000
         })
-        .connectionPool(ConnectionPool(1000, 60, TimeUnit.SECONDS))
+        .connectionPool(ConnectionPool(1500, 60, TimeUnit.SECONDS))
         .build()
 
     // Добавляем sliding window rate limiter на основе параметров аккаунта
