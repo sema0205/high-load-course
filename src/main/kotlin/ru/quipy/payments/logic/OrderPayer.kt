@@ -38,21 +38,40 @@ class OrderPayer {
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
         val createdAt = System.currentTimeMillis()
+
         paymentExecutor.submit(
             ThreadPoolExecutorTask {
-                val createdEvent = paymentESService.create {
-                    it.create(
-                        paymentId,
-                        orderId,
-                        amount
-                    )
+                try {
+                    val createdEvent = paymentESService.create {
+                        it.create(
+                            paymentId,
+                            orderId,
+                            amount
+                        )
+                    }
+                    logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+
+                    val future = paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+
+                    future.whenCompleteAsync({ success, error ->
+                        when {
+                            error != null -> {
+                                logger.error("Payment $paymentId failed with exception: ${error.message}")
+                            }
+                            success -> {
+                                logger.info("Payment $paymentId succeeded")
+                            }
+                            else -> {
+                                logger.warn("Payment $paymentId failed (no exception)")
+                            }
+                        }
+                    }, paymentExecutor)
+
+                } catch (e: Exception) {
+                    logger.error("Failed to create payment for order $orderId", e)
                 }
-                logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+            })
 
-                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
-            }
-        )
-
-        return createdAt
+            return createdAt
     }
 }

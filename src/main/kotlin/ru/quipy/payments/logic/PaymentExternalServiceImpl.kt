@@ -14,6 +14,7 @@ import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
@@ -76,8 +77,9 @@ class PaymentExternalSystemAdapterImpl(
 
     private val semaphore = Semaphore(parallelRequests, true)
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): CompletableFuture<Boolean> {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+        val future = CompletableFuture<Boolean>()
 
         val requestStartTime = System.currentTimeMillis()
 
@@ -106,8 +108,11 @@ class PaymentExternalSystemAdapterImpl(
             deadline,
             attempt = 1,
             transactionId,
-            requestStartTime
+            requestStartTime,
+            future
         )
+
+        return future
     }
 
     private fun executePaymentRequestAsync(
@@ -117,14 +122,15 @@ class PaymentExternalSystemAdapterImpl(
         deadline: Long,
         attempt: Int,
         transactionId: UUID,
-        requestStartTime: Long
+        requestStartTime: Long,
+        future: CompletableFuture<Boolean>
     ) {
         if (now() >= deadline) {
             logger.error("[$accountName] Deadline exceeded before attempt ${attempt} for payment $paymentId")
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
             }
-
+            future.complete(false)
             completeRequest(requestStartTime)
             return
         }
@@ -152,7 +158,7 @@ class PaymentExternalSystemAdapterImpl(
                             paymentESService.update(paymentId) {
                                 it.logProcessing(true, now(), transactionId, reason = body.message)
                             }
-
+                            future.complete(true)
                             completeRequest(requestStartTime)
                         } else if (body.message == TEMPORARY_ERROR) {
                             // Временная ошибка - retry если есть время
@@ -163,19 +169,21 @@ class PaymentExternalSystemAdapterImpl(
                                 deadline,
                                 attempt,
                                 transactionId,
-                                requestStartTime
+                                requestStartTime,
+                                future
                             )
                         } else {
                             // Постоянная ошибка или последняя попытка
                             paymentESService.update(paymentId) {
                                 it.logProcessing(false, now(), transactionId, reason = body.message)
                             }
-
+                            future.complete(false)
                             completeRequest(requestStartTime)
                         }
                     }
                 } catch (e: Exception) {
                     logger.error("Error processing response", e)
+                    future.completeExceptionally(e)
                     completeRequest(requestStartTime)
                 }
             }
@@ -194,7 +202,8 @@ class PaymentExternalSystemAdapterImpl(
                         deadline,
                         attempt,
                         transactionId,
-                        requestStartTime
+                        requestStartTime,
+                        future
                     )
                 } else {
                     logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
@@ -202,7 +211,7 @@ class PaymentExternalSystemAdapterImpl(
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = e.message)
                     }
-
+                    future.completeExceptionally(e)
                     completeRequest(requestStartTime)
                 }
             }
@@ -216,7 +225,8 @@ class PaymentExternalSystemAdapterImpl(
         deadline: Long,
         attempt: Int,
         transactionId: UUID,
-        requestStartTime: Long
+        requestStartTime: Long,
+        future: CompletableFuture<Boolean>
     ) {
         val nextAttempt = attempt + 1
         if (nextAttempt > MAX_ATTEMPTS) {
@@ -228,7 +238,7 @@ class PaymentExternalSystemAdapterImpl(
                     transactionId,
                     reason = "Max attempts reached")
             }
-
+            future.complete(false)
             completeRequest(requestStartTime)
             return
         }
@@ -240,13 +250,14 @@ class PaymentExternalSystemAdapterImpl(
             retryCounter.increment()
 
             executePaymentRequestAsync(
-                    paymentId = paymentId,
-                    amount = amount,
-                    paymentStartedAt = paymentStartedAt,
-                    deadline = deadline,
-                    attempt = nextAttempt,
-                    transactionId = transactionId,
-                    requestStartTime = requestStartTime
+                paymentId = paymentId,
+                amount = amount,
+                paymentStartedAt = paymentStartedAt,
+                deadline = deadline,
+                attempt = nextAttempt,
+                transactionId = transactionId,
+                requestStartTime = requestStartTime,
+                future = future
             )
         } else {
             logger.error("[$accountName] Not enough time for retry, deadline too close")
@@ -258,7 +269,7 @@ class PaymentExternalSystemAdapterImpl(
                     reason = "Temporary error, no time for retry"
                 )
             }
-
+            future.complete(false)
             completeRequest(requestStartTime)
         }
     }
