@@ -5,16 +5,17 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
+import okhttp3.*
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.IOException
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 
@@ -35,7 +36,6 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
 
         const val MAX_ATTEMPTS = 3
-        const val RETRY_DELAY_MS = 300L
         const val TEMPORARY_ERROR = "Temporary error"
     }
 
@@ -59,7 +59,14 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val client = OkHttpClient.Builder()
-        .callTimeout(Duration.ofMillis(1500))
+        .callTimeout(Duration.ofMillis(30000))
+        .readTimeout(Duration.ofMillis(30000))
+        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+        .dispatcher(Dispatcher().apply {
+            maxRequests = 20000
+            maxRequestsPerHost = 20000
+        })
+        .connectionPool(ConnectionPool(20000, 60, TimeUnit.SECONDS))
         .build()
 
     // Добавляем sliding window rate limiter на основе параметров аккаунта
@@ -70,8 +77,9 @@ class PaymentExternalSystemAdapterImpl(
 
     private val semaphore = Semaphore(parallelRequests, true)
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): CompletableFuture<Boolean> {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+        val future = CompletableFuture<Boolean>()
 
         val requestStartTime = System.currentTimeMillis()
 
@@ -93,102 +101,180 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
 
-        for (attempt in 0 until MAX_ATTEMPTS) {
-            if (now() >= deadline) {
-                logger.error("[$accountName] Deadline exceeded before attempt ${attempt + 1} for payment $paymentId")
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
-                }
-                break
+        executePaymentRequestAsync(
+            paymentId,
+            amount,
+            paymentStartedAt,
+            deadline,
+            attempt = 1,
+            transactionId,
+            requestStartTime,
+            future
+        )
+
+        return future
+    }
+
+    private fun executePaymentRequestAsync(
+        paymentId: UUID,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long,
+        attempt: Int,
+        transactionId: UUID,
+        requestStartTime: Long,
+        future: CompletableFuture<Boolean>
+    ) {
+        if (now() >= deadline) {
+            logger.error("[$accountName] Deadline exceeded before attempt ${attempt} for payment $paymentId")
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
             }
-
-            try {
-                val request = Request.Builder().run {
-                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=${Duration.ofMillis(1500)}")
-                    post(emptyBody)
-                }.build()
-
-                client.newCall(request).execute().use { response ->
-                    val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                    }
-
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, attempt ${attempt + 1}, succeeded: ${body.result}, message: ${body.message}")
-
-                    if (body.result) {
-                        // Успех - завершаем
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(true, now(), transactionId, reason = body.message)
-                        }
-                        break
-                    } else if (body.message == TEMPORARY_ERROR && attempt < MAX_ATTEMPTS - 1) {
-                        // Временная ошибка - retry если есть время
-                        val timeForRetry = now() + RETRY_DELAY_MS + requestAverageProcessingTime.toMillis()
-                        if (timeForRetry < deadline) {
-                            logger.warn("[$accountName] Temporary error for payment $paymentId, retrying after $RETRY_DELAY_MS ms")
-                            retryCounter.increment()
-                            Thread.sleep(RETRY_DELAY_MS)
-                            continue
-                        } else {
-                            logger.error("[$accountName] Not enough time for retry, deadline too close")
-                            paymentESService.update(paymentId) {
-                                it.logProcessing(
-                                    false,
-                                    now(),
-                                    transactionId,
-                                    reason = "Temporary error, no time for retry"
-                                )
-                            }
-                            break
-                        }
-                    } else {
-                        // Постоянная ошибка или последняя попытка
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = body.message)
-                        }
-                        break
-                    }
-                }
-
-            } catch (e: Exception) {
-                when (e) {
-                    is SocketTimeoutException -> {
-                        logger.error(
-                            "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId, attempt ${attempt + 1}",
-                            e
-                        )
-
-                        if (attempt < MAX_ATTEMPTS - 1) {
-                            val timeForRetry = now() + RETRY_DELAY_MS + requestAverageProcessingTime.toMillis()
-                            if (timeForRetry < deadline) {
-                                logger.warn("[$accountName] SocketTimeout for payment $paymentId, retrying after $RETRY_DELAY_MS ms")
-                                retryCounter.increment()
-                                Thread.sleep(RETRY_DELAY_MS)
-                                continue
-                            }
-                        }
-
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                        }
-                        break
-                    }
-
-                    else -> {
-                        logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = e.message)
-                        }
-                        break
-                    }
-                }
-            }
+            future.complete(false)
+            completeRequest(requestStartTime)
+            return
         }
 
+        val request = Request.Builder().run {
+            url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=${Duration.ofMillis(30000)}")
+            post(emptyBody)
+        }.build()
+
+        client.newCall(request).enqueue(object : Callback {
+            override fun onResponse(call: Call, response: Response) {
+                try {
+                    response.use { resp ->
+                        val body = try {
+                            mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                        } catch (e: Exception) {
+                            logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                        }
+
+                        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, attempt ${attempt}, succeeded: ${body.result}, message: ${body.message}")
+
+                        if (body.result) {
+                            // Успех - завершаем
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(true, now(), transactionId, reason = body.message)
+                            }
+                            future.complete(true)
+                            completeRequest(requestStartTime)
+                        } else if (body.message == TEMPORARY_ERROR) {
+                            // Временная ошибка - retry если есть время
+                            handleRetryableRequestError(
+                                paymentId,
+                                amount,
+                                paymentStartedAt,
+                                deadline,
+                                attempt,
+                                transactionId,
+                                requestStartTime,
+                                future
+                            )
+                        } else {
+                            // Постоянная ошибка или последняя попытка
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = body.message)
+                            }
+                            future.complete(false)
+                            completeRequest(requestStartTime)
+                        }
+                    }
+                } catch (e: Exception) {
+                    logger.error("Error processing response", e)
+                    future.completeExceptionally(e)
+                    completeRequest(requestStartTime)
+                }
+            }
+
+            override fun onFailure(call: Call, e: IOException) {
+                if (e is SocketTimeoutException) {
+                    logger.error(
+                        "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId, attempt ${attempt}",
+                        e
+                    )
+
+                    handleRetryableRequestError(
+                        paymentId,
+                        amount,
+                        paymentStartedAt,
+                        deadline,
+                        attempt,
+                        transactionId,
+                        requestStartTime,
+                        future
+                    )
+                } else {
+                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = e.message)
+                    }
+                    future.completeExceptionally(e)
+                    completeRequest(requestStartTime)
+                }
+            }
+        })
+    }
+
+    private fun handleRetryableRequestError(
+        paymentId: UUID,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long,
+        attempt: Int,
+        transactionId: UUID,
+        requestStartTime: Long,
+        future: CompletableFuture<Boolean>
+    ) {
+        val nextAttempt = attempt + 1
+        if (nextAttempt > MAX_ATTEMPTS) {
+            logger.error("[$accountName] Payment max attempts reached for txId: $transactionId, payment: $paymentId")
+            paymentESService.update(paymentId) {
+                it.logProcessing(
+                    false,
+                    now(),
+                    transactionId,
+                    reason = "Max attempts reached")
+            }
+            future.complete(false)
+            completeRequest(requestStartTime)
+            return
+        }
+
+        val timeForRetry = now() + requestAverageProcessingTime.toMillis()
+
+        if (timeForRetry < deadline) {
+            logger.warn("[$accountName] Temporary error for payment $paymentId, retrying")
+            retryCounter.increment()
+
+            executePaymentRequestAsync(
+                paymentId = paymentId,
+                amount = amount,
+                paymentStartedAt = paymentStartedAt,
+                deadline = deadline,
+                attempt = nextAttempt,
+                transactionId = transactionId,
+                requestStartTime = requestStartTime,
+                future = future
+            )
+        } else {
+            logger.error("[$accountName] Not enough time for retry, deadline too close")
+            paymentESService.update(paymentId) {
+                it.logProcessing(
+                    false,
+                    now(),
+                    transactionId,
+                    reason = "Temporary error, no time for retry"
+                )
+            }
+            future.complete(false)
+            completeRequest(requestStartTime)
+        }
+    }
+
+    private fun completeRequest(requestStartTime: Long) {
         val requestFinishTime = System.currentTimeMillis()
         requestLatency.record(requestFinishTime - requestStartTime, TimeUnit.MILLISECONDS)
 

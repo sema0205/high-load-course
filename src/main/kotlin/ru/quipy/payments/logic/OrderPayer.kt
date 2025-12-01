@@ -27,33 +27,51 @@ class OrderPayer {
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = ThreadPoolExecutor(
-        50,
-        50,
+        5000,
+        5000,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(120_000),
+        LinkedBlockingQueue(50_000),
         NamedThreadFactory("payment-submission-executor"),
         CallerBlockingRejectedExecutionHandler()
     )
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
-
         val createdAt = System.currentTimeMillis()
+
         paymentExecutor.submit(
             ThreadPoolExecutorTask {
-                val createdEvent = paymentESService.create {
-                    it.create(
-                        paymentId,
-                        orderId,
-                        amount
-                    )
+                try {
+                    val createdEvent = paymentESService.create {
+                        it.create(
+                            paymentId,
+                            orderId,
+                            amount
+                        )
+                    }
+                    logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+
+                    val future = paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+
+                    future.whenCompleteAsync({ success, error ->
+                        when {
+                            error != null -> {
+                                logger.error("Payment $paymentId failed with exception: ${error.message}")
+                            }
+                            success -> {
+                                logger.info("Payment $paymentId succeeded")
+                            }
+                            else -> {
+                                logger.warn("Payment $paymentId failed (no exception)")
+                            }
+                        }
+                    }, paymentExecutor)
+
+                } catch (e: Exception) {
+                    logger.error("Failed to create payment for order $orderId", e)
                 }
-                logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+            })
 
-                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
-            }
-        )
-
-        return createdAt
+            return createdAt
     }
 }
