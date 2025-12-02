@@ -34,7 +34,6 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
 
         const val MAX_ATTEMPTS = 3
-        const val RETRY_DELAY_MS = 300L
         const val TEMPORARY_ERROR = "Temporary error"
     }
 
@@ -58,6 +57,10 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val client = OkHttpClient.Builder()
+        .dispatcher(Dispatcher().apply {
+            maxRequests = 20000
+            maxRequestsPerHost = 20000
+        })
         .callTimeout(Duration.ofMillis(30000))
         .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
         .build()
