@@ -75,7 +75,7 @@ class PaymentExternalSystemAdapterImpl(
         .register(meterRegistry)
 
     private val client = OkHttpClient.Builder()
-        .dispatcher(Dispatcher(httpClientExecutor).apply {
+        .dispatcher(Dispatcher().apply {
             maxRequests = 20000
             maxRequestsPerHost = 20000
         })
