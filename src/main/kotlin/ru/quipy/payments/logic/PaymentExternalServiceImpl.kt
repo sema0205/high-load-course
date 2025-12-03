@@ -61,8 +61,8 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val httpClientExecutor = ThreadPoolExecutor(
-        500,
-        500,
+        5000,
+        5000,
         0,
         TimeUnit.SECONDS,
         LinkedBlockingQueue<Runnable>(),
@@ -70,8 +70,8 @@ class PaymentExternalSystemAdapterImpl(
     )
 
     private val dbExecutor = ThreadPoolExecutor(
-        200,
-        200,
+        500,
+        500,
         0,
         TimeUnit.SECONDS,
         LinkedBlockingQueue<Runnable>(),
