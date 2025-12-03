@@ -3,18 +3,22 @@ package ru.quipy.payments.logic
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Counter
+import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
 import okhttp3.*
 import okhttp3.Protocol
 import org.slf4j.LoggerFactory
+import ru.quipy.common.utils.NamedThreadFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.Semaphore
+import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
 
@@ -56,11 +60,26 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
+    private val httpClientExecutor = ThreadPoolExecutor(
+        0,
+        2000,
+        60L,
+        TimeUnit.SECONDS,
+        LinkedBlockingQueue<Runnable>(),
+        NamedThreadFactory("payment-http-client")
+    )
+
+    private val httpClientQueueSizeGauge: Gauge = Gauge
+        .builder("payment_http_client_queue_size") { httpClientExecutor.queue.size.toDouble() }
+        .description("Current size of the HTTP client request queue")
+        .register(meterRegistry)
+
     private val client = OkHttpClient.Builder()
-        .dispatcher(Dispatcher().apply {
+        .dispatcher(Dispatcher(httpClientExecutor).apply {
             maxRequests = 20000
             maxRequestsPerHost = 20000
         })
+        .connectionPool(ConnectionPool(10000, 60, TimeUnit.SECONDS))
         .callTimeout(Duration.ofMillis(30000))
         .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
         .build()
