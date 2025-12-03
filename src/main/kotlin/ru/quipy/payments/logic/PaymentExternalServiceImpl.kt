@@ -61,8 +61,8 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val httpClientExecutor = ThreadPoolExecutor(
-        0,
-        2000,
+        1000,
+        1000,
         60L,
         TimeUnit.SECONDS,
         LinkedBlockingQueue<Runnable>(),
@@ -75,7 +75,7 @@ class PaymentExternalSystemAdapterImpl(
         .register(meterRegistry)
 
     private val client = OkHttpClient.Builder()
-        .dispatcher(Dispatcher().apply {
+        .dispatcher(Dispatcher(httpClientExecutor).apply {
             maxRequests = 20000
             maxRequestsPerHost = 20000
         })
