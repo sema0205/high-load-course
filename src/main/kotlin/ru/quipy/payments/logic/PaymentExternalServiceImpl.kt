@@ -65,7 +65,7 @@ class PaymentExternalSystemAdapterImpl(
         5000,
         0,
         TimeUnit.SECONDS,
-        LinkedBlockingQueue(10000),
+        LinkedBlockingQueue(20000),
         NamedThreadFactory("payment-http-client")
     )
 
@@ -88,7 +88,7 @@ class PaymentExternalSystemAdapterImpl(
             maxRequests = 20000
             maxRequestsPerHost = 20000
         })
-        .connectionPool(ConnectionPool(1000, 20, TimeUnit.SECONDS))
+        .connectionPool(ConnectionPool(100, 20, TimeUnit.SECONDS))
         .callTimeout(Duration.ofMillis(30000))
         .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
         .build()
