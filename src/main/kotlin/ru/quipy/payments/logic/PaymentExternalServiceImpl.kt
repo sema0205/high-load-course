@@ -65,7 +65,7 @@ class PaymentExternalSystemAdapterImpl(
         5000,
         0,
         TimeUnit.SECONDS,
-        LinkedBlockingQueue(20000),
+        LinkedBlockingQueue(50000),
         NamedThreadFactory("payment-http-client")
     )
 
@@ -85,7 +85,7 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder()
         .dispatcher(Dispatcher(httpClientExecutor).apply {
-            maxRequests = 20000
+            maxRequests = 50000
             maxRequestsPerHost = 20000
         })
         .connectionPool(ConnectionPool(100, 20, TimeUnit.SECONDS))
