@@ -61,11 +61,11 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val httpClientExecutor = ThreadPoolExecutor(
-        20000,
-        20000,
+        5000,
+        5000,
         0,
         TimeUnit.SECONDS,
-        LinkedBlockingQueue<Runnable>(),
+        LinkedBlockingQueue(10000),
         NamedThreadFactory("payment-http-client")
     )
 
@@ -74,7 +74,7 @@ class PaymentExternalSystemAdapterImpl(
         500,
         0,
         TimeUnit.SECONDS,
-        LinkedBlockingQueue<Runnable>(),
+        LinkedBlockingQueue(10000),
         NamedThreadFactory("payment-db-callback")
     )
 
@@ -88,7 +88,7 @@ class PaymentExternalSystemAdapterImpl(
             maxRequests = 20000
             maxRequestsPerHost = 20000
         })
-        .connectionPool(ConnectionPool(10000, 60, TimeUnit.SECONDS))
+        .connectionPool(ConnectionPool(1000, 20, TimeUnit.SECONDS))
         .callTimeout(Duration.ofMillis(30000))
         .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
         .build()
