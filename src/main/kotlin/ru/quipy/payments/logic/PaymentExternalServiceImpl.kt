@@ -22,7 +22,6 @@ import java.util.*
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
-import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.Semaphore
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
@@ -42,22 +41,14 @@ class PaymentExternalSystemAdapterImpl(
 
         val mapper = ObjectMapper().registerKotlinModule()
 
-        const val MAX_ATTEMPTS = 2
         const val REQUEST_TIMEOUT_MS = 1100L
-        const val RETRY_DELAY_MS = 20L
-        const val TEMPORARY_ERROR = "Temporary error"
 
         const val HTTP_CLIENT_THREADS = 100
         const val DB_CALLBACK_THREADS = 100
-        const val DISPATCH_THREADS = 20
     }
 
     private val requestCounter = Counter.builder("http_shop_payment_requests")
         .description("Total number of requests sent by shop to payment service")
-        .register(meterRegistry)
-
-    private val retryCounter = Counter.builder("payment_retry_count")
-        .description("Number of payment retries")
         .register(meterRegistry)
 
     private val requestLatency = Timer.builder("payment_request_latency")
@@ -89,11 +80,6 @@ class PaymentExternalSystemAdapterImpl(
         NamedThreadFactory("payment-db-callback")
     )
 
-    private val dispatchExecutor = ScheduledThreadPoolExecutor(
-        DISPATCH_THREADS,
-        NamedThreadFactory("payment-dispatch")
-    )
-
     private val httpClientQueueSizeGauge: Gauge = Gauge
         .builder("payment_http_client_queue_size") { httpClientExecutor.queue.size.toDouble() }
         .description("Current size of the HTTP client request queue")
@@ -112,12 +98,19 @@ class PaymentExternalSystemAdapterImpl(
 
     private val semaphore = Semaphore(parallelRequests, false)
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override fun performPaymentAsync(
+        paymentId: UUID,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long
+    ): CompletableFuture<Boolean> {
         logger.debug("[$accountName] Submitting payment request for payment $paymentId")
 
         val requestStartTime = System.currentTimeMillis()
+        val resultFuture = CompletableFuture<Boolean>()
 
-        dispatchPaymentAsync(paymentId, amount, paymentStartedAt, requestStartTime, deadline)
+        dispatchPaymentAsync(paymentId, amount, paymentStartedAt, requestStartTime, deadline, resultFuture)
+        return resultFuture
     }
 
     private fun dispatchPaymentAsync(
@@ -125,7 +118,8 @@ class PaymentExternalSystemAdapterImpl(
         amount: Int,
         paymentStartedAt: Long,
         requestStartTime: Long,
-        deadline: Long
+        deadline: Long,
+        resultFuture: CompletableFuture<Boolean>
     ) {
         if (now() >= deadline) {
             logger.error("[$accountName] Deadline exceeded before dispatch for payment $paymentId")
@@ -133,6 +127,7 @@ class PaymentExternalSystemAdapterImpl(
                 it.logProcessing(false, now(), null, reason = "Deadline exceeded before dispatch")
             }
             finishPayment(false, "Deadline exceeded before dispatch", requestStartTime, null, paymentId, releaseSemaphore = false)
+            resultFuture.complete(false)
             return
         }
 
@@ -142,6 +137,7 @@ class PaymentExternalSystemAdapterImpl(
                 it.logProcessing(false, now(), null, reason = "No free slot")
             }
             finishPayment(false, "No free slot", requestStartTime, null, paymentId, releaseSemaphore = false)
+            resultFuture.complete(false)
             return
         }
 
@@ -152,6 +148,7 @@ class PaymentExternalSystemAdapterImpl(
                 it.logProcessing(false, now(), null, reason = "Rate limit exceeded")
             }
             finishPayment(false, "Rate limit exceeded", requestStartTime, null, paymentId, releaseSemaphore = false)
+            resultFuture.complete(false)
             return
         }
 
@@ -167,30 +164,32 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
             logger.debug("[$accountName] Submit: $paymentId , txId: $transactionId")
-            sendRequestAsync(0, paymentId, amount, requestStartTime, deadline, transactionId)
+            sendRequestAsync(paymentId, amount, requestStartTime, deadline, transactionId, resultFuture)
         } catch (e: Exception) {
             logger.error("[$accountName] Failed to submit payment $paymentId", e)
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = e.message)
             }
             finishPayment(false, e.message, requestStartTime, transactionId, paymentId)
+            resultFuture.complete(false)
         }
     }
 
     fun sendRequestAsync(
-        attempt: Int,
         paymentId: UUID,
         amount: Int,
         requestStartTime: Long,
         deadline: Long,
-        transactionId: UUID
+        transactionId: UUID,
+        completionFuture: CompletableFuture<Boolean>
     ) {
         if (now() >= deadline) {
-            logger.error("[$accountName] Deadline exceeded before attempt $attempt for payment $paymentId")
+            logger.error("[$accountName] Deadline exceeded before request for payment $paymentId")
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
             }
             finishPayment(false, "Deadline exceeded", requestStartTime, transactionId, paymentId)
+            completionFuture.complete(false)
             return
         }
 
@@ -211,7 +210,7 @@ class PaymentExternalSystemAdapterImpl(
             .POST(HttpRequest.BodyPublishers.noBody())
             .build()
 
-        val resultFuture: CompletableFuture<HttpResult> = httpClient
+        val httpResultFuture: CompletableFuture<HttpResult> = httpClient
             .sendAsync(httpRequest, HttpResponse.BodyHandlers.ofString())
             .handle { response, ex ->
                 if (ex != null) {
@@ -222,27 +221,23 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
 
-        resultFuture
+        httpResultFuture
             .thenAccept { result ->
                 when (result) {
                     is HttpResult.Completed -> handleCompletedResponse(
                         result.response,
-                        attempt,
                         paymentId,
-                        amount,
                         requestStartTime,
-                        deadline,
-                        transactionId
+                        transactionId,
+                        completionFuture
                     )
 
                     is HttpResult.Failed -> handleFailedResponse(
                         result.cause,
-                        attempt,
                         paymentId,
-                        amount,
                         requestStartTime,
-                        deadline,
-                        transactionId
+                        transactionId,
+                        completionFuture
                     )
                 }
             }
@@ -265,71 +260,39 @@ class PaymentExternalSystemAdapterImpl(
 
     private fun handleFailedResponse(
         cause: Throwable,
-        attempt: Int,
         paymentId: UUID,
-        amount: Int,
         requestStartTime: Long,
-        deadline: Long,
-        transactionId: UUID
+        transactionId: UUID,
+        resultFuture: CompletableFuture<Boolean>
     ) {
         when (cause) {
             is HttpTimeoutException, is SocketTimeoutException -> {
                 logger.error(
-                    "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId, attempt ${attempt + 1}",
+                    "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId",
                     cause
                 )
-
-                if (attempt < MAX_ATTEMPTS - 1 && now() < deadline) {
-                    logger.warn("[$accountName] SocketTimeout for payment $paymentId, retrying immediately")
-                    retryCounter.increment()
-                    dispatchExecutor.schedule(
-                        {
-                            sendRequestAsync(attempt + 1, paymentId, amount, requestStartTime, deadline, transactionId)
-                        },
-                        RETRY_DELAY_MS,
-                        TimeUnit.MILLISECONDS
-                    )
-                } else {
-                    submitFinalization(paymentId, transactionId, false, "Request timeout.", requestStartTime)
-                }
+                submitFinalization(paymentId, transactionId, false, "Request timeout.", requestStartTime)
+                resultFuture.complete(false)
             }
 
             else -> {
                 logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", cause)
                 submitFinalization(paymentId, transactionId, false, cause.message, requestStartTime)
+                resultFuture.complete(false)
             }
         }
     }
 
     private fun handleCompletedResponse(
         body: ExternalSysResponse,
-        attempt: Int,
         paymentId: UUID,
-        amount: Int,
         requestStartTime: Long,
-        deadline: Long,
-        transactionId: UUID
+        transactionId: UUID,
+        resultFuture: CompletableFuture<Boolean>
     ) {
-        logger.debug("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, attempt ${attempt + 1}, succeeded: ${body.result}, message: ${body.message}")
-
-        if (body.result) {
-            submitFinalization(paymentId, transactionId, true, body.message, requestStartTime)
-        } else if (body.message == TEMPORARY_ERROR && attempt < MAX_ATTEMPTS - 1 && now() < deadline) {
-            logger.warn("[$accountName] Temporary error for payment $paymentId, retrying immediately")
-            retryCounter.increment()
-            dispatchExecutor.schedule(
-                {
-                    sendRequestAsync(attempt + 1, paymentId, amount, requestStartTime, deadline, transactionId)
-                },
-                RETRY_DELAY_MS,
-                TimeUnit.MILLISECONDS
-            )
-        } else if (body.message == TEMPORARY_ERROR && attempt < MAX_ATTEMPTS - 1 && now() >= deadline) {
-            logger.error("[$accountName] Not enough time for retry, deadline too close")
-            submitFinalization(paymentId, transactionId, false, "Temporary error, no time for retry", requestStartTime)
-        } else {
-            submitFinalization(paymentId, transactionId, false, body.message, requestStartTime)
-        }
+        logger.debug("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+        submitFinalization(paymentId, transactionId, body.result, body.message, requestStartTime)
+        resultFuture.complete(body.result)
     }
 
     private fun submitFinalization(

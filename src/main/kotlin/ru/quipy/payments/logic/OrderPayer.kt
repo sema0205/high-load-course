@@ -10,8 +10,9 @@ import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.ScheduledThreadPoolExecutor
+import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
@@ -23,6 +24,8 @@ class OrderPayer {
         const val SUBMISSION_THREADS = 256
         const val ADMISSION_RATE_PER_SEC = 4000L
         const val ADMISSION_BUCKET_SIZE = 4000
+        const val MAX_RETRY_ATTEMPTS = 2
+        const val RETRY_BASE_DELAY_MS = 25L
     }
 
     @Autowired
@@ -31,15 +34,16 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    private val paymentExecutor = ThreadPoolExecutor(
+    private val paymentExecutor = ScheduledThreadPoolExecutor(
         SUBMISSION_THREADS,
-        SUBMISSION_THREADS,
-        0L,
-        TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(5000),
-        NamedThreadFactory("payment-submission-executor"),
-        ThreadPoolExecutor.AbortPolicy()
+        NamedThreadFactory("payment-submission-executor")
     )
+
+    init {
+        paymentExecutor.maximumPoolSize = SUBMISSION_THREADS
+        paymentExecutor.rejectedExecutionHandler = ThreadPoolExecutor.AbortPolicy()
+        paymentExecutor.setRemoveOnCancelPolicy(true)
+    }
 
     private val admissionLimiter = LeakingBucketRateLimiter(
         rate = ADMISSION_RATE_PER_SEC,
@@ -65,7 +69,7 @@ class OrderPayer {
                     }
                     logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
-                    paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+                    retryAsync(paymentId, amount, createdAt, deadline, attempt = 1)
                 }
             )
             createdAt
@@ -73,5 +77,56 @@ class OrderPayer {
             logger.warn("Payment submission rejected for paymentId=$paymentId, orderId=$orderId")
             null
         }
+    }
+
+    private fun retryAsync(
+        paymentId: UUID,
+        amount: Int,
+        createdAt: Long,
+        deadline: Long,
+        attempt: Int
+    ) {
+        val timeLeft = deadline - System.currentTimeMillis()
+        if (timeLeft <= 0) {
+            return
+        }
+
+        paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
+            .orTimeout(timeLeft, TimeUnit.MILLISECONDS)
+            .whenCompleteAsync({ success, error ->
+                if (success == true) {
+                    return@whenCompleteAsync
+                }
+
+                if (error != null) {
+                    logger.debug("Payment $paymentId attempt #$attempt failed: ${error.message}")
+                }
+
+                if (attempt >= MAX_RETRY_ATTEMPTS || System.currentTimeMillis() >= deadline) {
+                    return@whenCompleteAsync
+                }
+
+                scheduleRetry(paymentId, amount, createdAt, deadline, attempt + 1)
+            }, paymentExecutor)
+    }
+
+    private fun scheduleRetry(
+        paymentId: UUID,
+        amount: Int,
+        createdAt: Long,
+        deadline: Long,
+        nextAttempt: Int
+    ) {
+        val timeLeft = deadline - System.currentTimeMillis()
+        if (timeLeft <= 0) return
+
+        val jitter = ThreadLocalRandom.current().nextLong(0, RETRY_BASE_DELAY_MS + 1)
+        val delayMs = minOf(RETRY_BASE_DELAY_MS + jitter, timeLeft)
+
+        paymentExecutor.schedule(
+            { retryAsync(paymentId, amount, createdAt, deadline, nextAttempt) },
+            delayMs,
+            TimeUnit.MILLISECONDS
+        )
     }
 }
