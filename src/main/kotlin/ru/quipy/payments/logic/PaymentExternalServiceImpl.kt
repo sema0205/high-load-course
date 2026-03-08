@@ -21,6 +21,7 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.Semaphore
 import java.util.concurrent.ThreadPoolExecutor
@@ -43,7 +44,6 @@ class PaymentExternalSystemAdapterImpl(
 
         const val MAX_ATTEMPTS = 2
         const val REQUEST_TIMEOUT_MS = 1100L
-        const val DISPATCH_RETRY_DELAY_MS = 5L
         const val RETRY_DELAY_MS = 20L
         const val TEMPORARY_ERROR = "Temporary error"
 
@@ -105,13 +105,12 @@ class PaymentExternalSystemAdapterImpl(
         .connectTimeout(Duration.ofSeconds(5))
         .build()
 
-    // Добавляем sliding window rate limiter на основе параметров аккаунта
     private val rateLimiter = SlidingWindowRateLimiter(
         rateLimitPerSec.toLong(),
         Duration.ofSeconds(1)
     )
 
-    private val semaphore = Semaphore(parallelRequests, true)
+    private val semaphore = Semaphore(parallelRequests, false)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         logger.debug("[$accountName] Submitting payment request for payment $paymentId")
@@ -162,8 +161,10 @@ class PaymentExternalSystemAdapterImpl(
         try {
             // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
             // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
-            paymentESService.update(paymentId) {
-                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            submitDbTask {
+                paymentESService.update(paymentId) {
+                    it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+                }
             }
             logger.debug("[$accountName] Submit: $paymentId , txId: $transactionId")
             sendRequestAsync(0, paymentId, amount, requestStartTime, deadline, transactionId)
@@ -174,22 +175,6 @@ class PaymentExternalSystemAdapterImpl(
             }
             finishPayment(false, e.message, requestStartTime, transactionId, paymentId)
         }
-    }
-
-    private fun scheduleDispatch(
-        paymentId: UUID,
-        amount: Int,
-        paymentStartedAt: Long,
-        requestStartTime: Long,
-        deadline: Long
-    ) {
-        dispatchExecutor.schedule(
-            {
-                dispatchPaymentAsync(paymentId, amount, paymentStartedAt, requestStartTime, deadline)
-            },
-            DISPATCH_RETRY_DELAY_MS,
-            TimeUnit.MILLISECONDS
-        )
     }
 
     fun sendRequestAsync(
@@ -354,7 +339,7 @@ class PaymentExternalSystemAdapterImpl(
         reason: String?,
         requestStartTime: Long
     ) {
-        dbExecutor.submit {
+        submitDbTask {
             paymentESService.update(paymentId) {
                 it.logProcessing(success, now(), transactionId, reason = reason)
             }
@@ -362,10 +347,20 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
+    private fun submitDbTask(task: () -> Unit) {
+        try {
+            dbExecutor.submit(task)
+        } catch (_: RejectedExecutionException) {
+            // Fail-safe: keep payment state consistent even under DB executor saturation.
+            task()
+        }
+    }
+
     private sealed interface HttpResult {
         data class Completed(val response: ExternalSysResponse) : HttpResult
         data class Failed(val cause: Throwable) : HttpResult
     }
+
 
     fun finishPayment(
         success: Boolean,

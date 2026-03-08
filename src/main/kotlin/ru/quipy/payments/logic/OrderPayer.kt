@@ -5,8 +5,10 @@ import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
 import ru.quipy.common.utils.*
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
@@ -18,7 +20,9 @@ class OrderPayer {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
-        const val SUBMISSION_THREADS = 128
+        const val SUBMISSION_THREADS = 256
+        const val ADMISSION_RATE_PER_SEC = 4000L
+        const val ADMISSION_BUCKET_SIZE = 4000
     }
 
     @Autowired
@@ -37,7 +41,17 @@ class OrderPayer {
         ThreadPoolExecutor.AbortPolicy()
     )
 
+    private val admissionLimiter = LeakingBucketRateLimiter(
+        rate = ADMISSION_RATE_PER_SEC,
+        window = Duration.ofSeconds(1),
+        bucketSize = ADMISSION_BUCKET_SIZE
+    )
+
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
+        if (!admissionLimiter.tick()) {
+            return null
+        }
+
         val createdAt = System.currentTimeMillis()
         return try {
             paymentExecutor.submit(
