@@ -10,6 +10,7 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
@@ -33,27 +34,30 @@ class OrderPayer {
         TimeUnit.MILLISECONDS,
         LinkedBlockingQueue(10_000),
         NamedThreadFactory("payment-submission-executor"),
-        CallerBlockingRejectedExecutionHandler()
+        ThreadPoolExecutor.AbortPolicy()
     )
 
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
-
         val createdAt = System.currentTimeMillis()
-        paymentExecutor.submit(
-            ThreadPoolExecutorTask {
-                val createdEvent = paymentESService.create {
-                    it.create(
-                        paymentId,
-                        orderId,
-                        amount
-                    )
+        return try {
+            paymentExecutor.submit(
+                ThreadPoolExecutorTask {
+                    val createdEvent = paymentESService.create {
+                        it.create(
+                            paymentId,
+                            orderId,
+                            amount
+                        )
+                    }
+                    logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
+
+                    paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
                 }
-                logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
-
-                paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
-            }
-        )
-
-        return createdAt
+            )
+            createdAt
+        } catch (e: RejectedExecutionException) {
+            logger.warn("Payment submission rejected for paymentId=$paymentId, orderId=$orderId")
+            null
+        }
     }
 }

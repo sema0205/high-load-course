@@ -41,8 +41,8 @@ class PaymentExternalSystemAdapterImpl(
 
         val mapper = ObjectMapper().registerKotlinModule()
 
-        const val MAX_ATTEMPTS = 2
-        const val REQUEST_TIMEOUT_MS = 250L
+        const val MAX_ATTEMPTS = 1
+        const val REQUEST_TIMEOUT_MS = 850L
         const val DISPATCH_RETRY_DELAY_MS = 5L
         const val TEMPORARY_ERROR = "Temporary error"
     }
