@@ -7,7 +7,6 @@ import org.springframework.stereotype.Service
 import ru.quipy.common.utils.*
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.time.Duration
 import java.util.*
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.RejectedExecutionException
@@ -19,6 +18,7 @@ class OrderPayer {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
+        const val SUBMISSION_THREADS = 128
     }
 
     @Autowired
@@ -28,11 +28,11 @@ class OrderPayer {
     private lateinit var paymentService: PaymentService
 
     private val paymentExecutor = ThreadPoolExecutor(
-        500,
-        500,
+        SUBMISSION_THREADS,
+        SUBMISSION_THREADS,
         0L,
         TimeUnit.MILLISECONDS,
-        LinkedBlockingQueue(10_000),
+        LinkedBlockingQueue(5000),
         NamedThreadFactory("payment-submission-executor"),
         ThreadPoolExecutor.AbortPolicy()
     )

@@ -45,6 +45,10 @@ class PaymentExternalSystemAdapterImpl(
         const val REQUEST_TIMEOUT_MS = 850L
         const val DISPATCH_RETRY_DELAY_MS = 5L
         const val TEMPORARY_ERROR = "Temporary error"
+
+        const val HTTP_CLIENT_THREADS = 100
+        const val DB_CALLBACK_THREADS = 100
+        const val DISPATCH_THREADS = 20
     }
 
     private val requestCounter = Counter.builder("http_shop_payment_requests")
@@ -67,25 +71,25 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
 
     private val httpClientExecutor = ThreadPoolExecutor(
-        16,
-        16,
+        HTTP_CLIENT_THREADS,
+        HTTP_CLIENT_THREADS,
         0,
         TimeUnit.SECONDS,
-        LinkedBlockingQueue<Runnable>(50000),
+        LinkedBlockingQueue<Runnable>(5000),
         NamedThreadFactory("payment-http-client")
     )
 
     private val dbExecutor = ThreadPoolExecutor(
-        500,
-        500,
+        DB_CALLBACK_THREADS,
+        DB_CALLBACK_THREADS,
         0,
         TimeUnit.SECONDS,
-        LinkedBlockingQueue(10000),
+        LinkedBlockingQueue(5000),
         NamedThreadFactory("payment-db-callback")
     )
 
     private val dispatchExecutor = ScheduledThreadPoolExecutor(
-        4,
+        DISPATCH_THREADS,
         NamedThreadFactory("payment-dispatch")
     )
 
@@ -109,7 +113,7 @@ class PaymentExternalSystemAdapterImpl(
     private val semaphore = Semaphore(parallelRequests, true)
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+        logger.debug("[$accountName] Submitting payment request for payment $paymentId")
 
         val requestStartTime = System.currentTimeMillis()
 
@@ -133,7 +137,11 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         if (!semaphore.tryAcquire()) {
-            scheduleDispatch(paymentId, amount, paymentStartedAt, requestStartTime, deadline)
+            logger.debug("[$accountName] No free slot for payment $paymentId")
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), null, reason = "No free slot")
+            }
+            finishPayment(false, "No free slot", requestStartTime, null, paymentId, releaseSemaphore = false)
             return
         }
 
@@ -152,7 +160,7 @@ class PaymentExternalSystemAdapterImpl(
             paymentESService.update(paymentId) {
                 it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
             }
-            logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+            logger.debug("[$accountName] Submit: $paymentId , txId: $transactionId")
             sendRequestAsync(0, paymentId, amount, requestStartTime, deadline, transactionId)
         } catch (e: Exception) {
             logger.error("[$accountName] Failed to submit payment $paymentId", e)
@@ -306,7 +314,7 @@ class PaymentExternalSystemAdapterImpl(
         deadline: Long,
         transactionId: UUID
     ) {
-        logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, attempt ${attempt + 1}, succeeded: ${body.result}, message: ${body.message}")
+        logger.debug("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, attempt ${attempt + 1}, succeeded: ${body.result}, message: ${body.message}")
 
         if (body.result) {
             submitFinalization(paymentId, transactionId, true, body.message, requestStartTime)
@@ -352,7 +360,7 @@ class PaymentExternalSystemAdapterImpl(
     ) {
         val requestFinishTime = System.currentTimeMillis()
         requestLatency.record(requestFinishTime - requestStartTime, TimeUnit.MILLISECONDS)
-        logger.info("[$accountName] Finished payment for txId: $transactionId, payment: $paymentId, success: $success, reason: $reason")
+        logger.debug("[$accountName] Finished payment for txId: $transactionId, payment: $paymentId, success: $success, reason: $reason")
         if (releaseSemaphore) {
             semaphore.release()
         }
