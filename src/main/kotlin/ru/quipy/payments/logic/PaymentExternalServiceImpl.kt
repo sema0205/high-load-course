@@ -41,9 +41,10 @@ class PaymentExternalSystemAdapterImpl(
 
         val mapper = ObjectMapper().registerKotlinModule()
 
-        const val MAX_ATTEMPTS = 1
-        const val REQUEST_TIMEOUT_MS = 850L
+        const val MAX_ATTEMPTS = 2
+        const val REQUEST_TIMEOUT_MS = 1100L
         const val DISPATCH_RETRY_DELAY_MS = 5L
+        const val RETRY_DELAY_MS = 20L
         const val TEMPORARY_ERROR = "Temporary error"
 
         const val HTTP_CLIENT_THREADS = 100
@@ -147,7 +148,11 @@ class PaymentExternalSystemAdapterImpl(
 
         if (!rateLimiter.tick()) {
             semaphore.release()
-            scheduleDispatch(paymentId, amount, paymentStartedAt, requestStartTime, deadline)
+            logger.debug("[$accountName] Rate limit exceeded for payment $paymentId")
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), null, reason = "Rate limit exceeded")
+            }
+            finishPayment(false, "Rate limit exceeded", requestStartTime, null, paymentId, releaseSemaphore = false)
             return
         }
 
@@ -292,7 +297,13 @@ class PaymentExternalSystemAdapterImpl(
                 if (attempt < MAX_ATTEMPTS - 1 && now() < deadline) {
                     logger.warn("[$accountName] SocketTimeout for payment $paymentId, retrying immediately")
                     retryCounter.increment()
-                    sendRequestAsync(attempt + 1, paymentId, amount, requestStartTime, deadline, transactionId)
+                    dispatchExecutor.schedule(
+                        {
+                            sendRequestAsync(attempt + 1, paymentId, amount, requestStartTime, deadline, transactionId)
+                        },
+                        RETRY_DELAY_MS,
+                        TimeUnit.MILLISECONDS
+                    )
                 } else {
                     submitFinalization(paymentId, transactionId, false, "Request timeout.", requestStartTime)
                 }
@@ -321,7 +332,13 @@ class PaymentExternalSystemAdapterImpl(
         } else if (body.message == TEMPORARY_ERROR && attempt < MAX_ATTEMPTS - 1 && now() < deadline) {
             logger.warn("[$accountName] Temporary error for payment $paymentId, retrying immediately")
             retryCounter.increment()
-            sendRequestAsync(attempt + 1, paymentId, amount, requestStartTime, deadline, transactionId)
+            dispatchExecutor.schedule(
+                {
+                    sendRequestAsync(attempt + 1, paymentId, amount, requestStartTime, deadline, transactionId)
+                },
+                RETRY_DELAY_MS,
+                TimeUnit.MILLISECONDS
+            )
         } else if (body.message == TEMPORARY_ERROR && attempt < MAX_ATTEMPTS - 1 && now() >= deadline) {
             logger.error("[$accountName] Not enough time for retry, deadline too close")
             submitFinalization(paymentId, transactionId, false, "Temporary error, no time for retry", requestStartTime)
