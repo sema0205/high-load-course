@@ -24,8 +24,9 @@ class OrderPayer {
         const val SUBMISSION_THREADS = 256
         const val ADMISSION_RATE_PER_SEC = 4000L
         const val ADMISSION_BUCKET_SIZE = 4000
-        const val MAX_RETRY_ATTEMPTS = 2
+        const val MAX_RETRY_ATTEMPTS = 1
         const val RETRY_BASE_DELAY_MS = 25L
+        const val DEADLINE_SAFETY_MS = 120L
     }
 
     @Autowired
@@ -87,12 +88,13 @@ class OrderPayer {
         attempt: Int
     ) {
         val timeLeft = deadline - System.currentTimeMillis()
-        if (timeLeft <= 0) {
+        val budget = timeLeft - DEADLINE_SAFETY_MS
+        if (budget <= 0) {
             return
         }
 
         paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
-            .orTimeout(timeLeft, TimeUnit.MILLISECONDS)
+            .orTimeout(budget, TimeUnit.MILLISECONDS)
             .whenCompleteAsync({ success, error ->
                 if (success == true) {
                     return@whenCompleteAsync
@@ -102,7 +104,7 @@ class OrderPayer {
                     logger.debug("Payment $paymentId attempt #$attempt failed: ${error.message}")
                 }
 
-                if (attempt >= MAX_RETRY_ATTEMPTS || System.currentTimeMillis() >= deadline) {
+                if (attempt >= MAX_RETRY_ATTEMPTS || System.currentTimeMillis() >= deadline - DEADLINE_SAFETY_MS) {
                     return@whenCompleteAsync
                 }
 

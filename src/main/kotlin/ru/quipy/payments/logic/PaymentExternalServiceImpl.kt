@@ -42,6 +42,8 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
 
         const val REQUEST_TIMEOUT_MS = 1100L
+        const val DEADLINE_SAFETY_MS = 120L
+        const val MIN_HTTP_TIMEOUT_MS = 150L
 
         const val HTTP_CLIENT_THREADS = 100
         const val DB_CALLBACK_THREADS = 100
@@ -121,7 +123,7 @@ class PaymentExternalSystemAdapterImpl(
         deadline: Long,
         resultFuture: CompletableFuture<Boolean>
     ) {
-        if (now() >= deadline) {
+        if (now() >= deadline - DEADLINE_SAFETY_MS) {
             logger.error("[$accountName] Deadline exceeded before dispatch for payment $paymentId")
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), null, reason = "Deadline exceeded before dispatch")
@@ -183,7 +185,8 @@ class PaymentExternalSystemAdapterImpl(
         transactionId: UUID,
         completionFuture: CompletableFuture<Boolean>
     ) {
-        if (now() >= deadline) {
+        val budgetMs = deadline - now() - DEADLINE_SAFETY_MS
+        if (budgetMs <= 0) {
             logger.error("[$accountName] Deadline exceeded before request for payment $paymentId")
             paymentESService.update(paymentId) {
                 it.logProcessing(false, now(), transactionId, reason = "Deadline exceeded")
@@ -193,7 +196,17 @@ class PaymentExternalSystemAdapterImpl(
             return
         }
 
-        val timeout = Duration.ofMillis(REQUEST_TIMEOUT_MS)
+        val timeoutMs = minOf(REQUEST_TIMEOUT_MS, budgetMs)
+        if (timeoutMs < MIN_HTTP_TIMEOUT_MS) {
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Insufficient time budget")
+            }
+            finishPayment(false, "Insufficient time budget", requestStartTime, transactionId, paymentId)
+            completionFuture.complete(false)
+            return
+        }
+
+        val timeout = Duration.ofMillis(timeoutMs)
 
         val uri = URI("http://$paymentProviderHostPort/external/process" +
                 "?serviceName=$serviceName" +
