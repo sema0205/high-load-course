@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
-import io.micrometer.core.instrument.Timer
 import okhttp3.*
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.NonBlockingOngoingWindow
@@ -31,7 +30,6 @@ class PaymentExternalSystemAdapterImpl(
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val emptyBody: RequestBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
-
         const val NUM_HTTP_CLIENTS = 15
         const val DB_POOL_SIZE = 200
     }
@@ -41,9 +39,8 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    // ──────────────────────────────────────────────
-    // HTTP client pool (round-robin, like friend's code)
-    // ──────────────────────────────────────────────
+    private val timeOut = Duration.ofSeconds(0)
+
     private val clients: List<OkHttpClient> = List(NUM_HTTP_CLIENTS) {
         val perClient = max(200, parallelRequests / 20)
         val exec = Executors.newFixedThreadPool(perClient)
@@ -59,11 +56,9 @@ class PaymentExternalSystemAdapterImpl(
             .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
             .build()
     }
+
     private val clientIndex = AtomicInteger(0)
 
-    // ──────────────────────────────────────────────
-    // Rate limiting & concurrency (non-blocking window + blocking rate limiter)
-    // ──────────────────────────────────────────────
     private val slidingWindowRateLimiter = SlidingWindowRateLimiter(
         rate = rateLimitPerSec.toLong(),
         window = Duration.ofSeconds(1)
@@ -71,14 +66,8 @@ class PaymentExternalSystemAdapterImpl(
 
     private val ongoingWindow = NonBlockingOngoingWindow(parallelRequests)
 
-    // ──────────────────────────────────────────────
-    // DB executor — simple thread pool, no batching overhead
-    // ──────────────────────────────────────────────
     private val dbExecutor = Executors.newFixedThreadPool(DB_POOL_SIZE)
 
-    // ──────────────────────────────────────────────
-    // Metrics
-    // ──────────────────────────────────────────────
     private val paymentAttemptsTotal: Counter = Counter.builder("payment_attempts_total")
         .description("Payment attempts sent to provider")
         .register(meterRegistry)
@@ -99,15 +88,6 @@ class PaymentExternalSystemAdapterImpl(
         .description("Total payment timeouts")
         .register(meterRegistry)
 
-    private val requestLatency: Timer = Timer.builder("payment_request_latency")
-        .description("Payment request latency")
-        .publishPercentiles(0.5, 0.85, 0.99)
-        .register(meterRegistry)
-
-    // ──────────────────────────────────────────────
-    // Main payment flow
-    // ──────────────────────────────────────────────
-
     override fun performPaymentAsync(
         paymentId: UUID,
         amount: Int,
@@ -116,12 +96,9 @@ class PaymentExternalSystemAdapterImpl(
     ): CompletableFuture<Boolean> {
         val transactionId = UUID.randomUUID()
         val cf = CompletableFuture<Boolean>()
-        val requestStartTime = now()
 
         paymentAttemptsTotal.increment()
 
-        // ── Non-blocking concurrency check ──
-        // If no slot available, reject immediately with NO DB write (avoids DB storm)
         if (ongoingWindow.putIntoWindow() is NonBlockingOngoingWindow.WindowResponse.Fail) {
             logger.debug("[$accountName] No free slot for payment $paymentId, rejecting")
             cf.complete(false)
@@ -130,7 +107,6 @@ class PaymentExternalSystemAdapterImpl(
 
         logger.debug("[$accountName] Submitting payment $paymentId, txId: $transactionId")
 
-        // ── Log submission asynchronously (fire-and-forget) ──
         dbExecutor.execute {
             try {
                 paymentESService.update(paymentId) {
@@ -147,13 +123,18 @@ class PaymentExternalSystemAdapterImpl(
         }
 
         try {
-            // ── BLOCKING rate limiter — wait for slot instead of rejecting ──
-            // This is the KEY difference: we wait until the rate limiter allows us through.
-            // This means almost every payment that gets a concurrency slot WILL be sent.
             slidingWindowRateLimiter.tickBlocking()
 
-            // ── Build request (no timeout param — let server decide) ──
-            val urlString =
+            val urlString = if (timeOut != Duration.ofSeconds(0)) {
+                "http://$paymentProviderHostPort/external/process" +
+                        "?timeout=$timeOut" +
+                        "&serviceName=$serviceName" +
+                        "&token=$token" +
+                        "&accountName=$accountName" +
+                        "&transactionId=$transactionId" +
+                        "&paymentId=$paymentId" +
+                        "&amount=$amount"
+            } else {
                 "http://$paymentProviderHostPort/external/process" +
                         "?serviceName=$serviceName" +
                         "&token=$token" +
@@ -161,13 +142,13 @@ class PaymentExternalSystemAdapterImpl(
                         "&transactionId=$transactionId" +
                         "&paymentId=$paymentId" +
                         "&amount=$amount"
+            }
 
             val request = Request.Builder()
                 .url(urlString)
                 .post(emptyBody)
                 .build()
 
-            // ── Round-robin client selection ──
             val idx = clientIndex.getAndIncrement()
             val client = clients[(idx and Int.MAX_VALUE) % clients.size]
 
@@ -176,7 +157,6 @@ class PaymentExternalSystemAdapterImpl(
                     try {
                         paymentFailureTotal.increment()
                         cf.complete(false)
-                        recordLatency(requestStartTime)
 
                         if (e is SocketTimeoutException) {
                             paymentTimeoutCounter.increment()
@@ -246,7 +226,6 @@ class PaymentExternalSystemAdapterImpl(
                         }
 
                         cf.complete(result)
-                        recordLatency(requestStartTime)
 
                         dbExecutor.execute {
                             try {
@@ -265,7 +244,6 @@ class PaymentExternalSystemAdapterImpl(
                         )
                         paymentFailureTotal.increment()
                         cf.complete(false)
-                        recordLatency(requestStartTime)
 
                         dbExecutor.execute {
                             try {
@@ -286,7 +264,6 @@ class PaymentExternalSystemAdapterImpl(
             })
         } catch (e: Exception) {
             paymentFailureTotal.increment()
-            recordLatency(requestStartTime)
 
             when (e) {
                 is SocketTimeoutException -> {
@@ -327,10 +304,6 @@ class PaymentExternalSystemAdapterImpl(
         } catch (u: Exception) {
             logger.error("[$accountName] Error releasing ongoingWindow", u)
         }
-    }
-
-    private fun recordLatency(requestStartTime: Long) {
-        requestLatency.record(now() - requestStartTime, TimeUnit.MILLISECONDS)
     }
 
     override fun price() = properties.price
