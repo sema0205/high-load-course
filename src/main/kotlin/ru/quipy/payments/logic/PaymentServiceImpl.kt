@@ -1,16 +1,10 @@
 package ru.quipy.payments.logic
 
 import org.slf4j.LoggerFactory
-import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
-import ru.quipy.common.utils.NamedThreadFactory
-import ru.quipy.core.EventSourcingService
-import ru.quipy.payments.api.PaymentAggregate
-import java.time.Duration
-import java.util.*
-import java.util.concurrent.Executors
-import java.util.concurrent.locks.ReentrantLock
-import kotlin.concurrent.withLock
+import java.util.UUID
+import java.util.concurrent.CompletableFuture
+import java.util.concurrent.atomic.AtomicInteger
 
 
 @Service
@@ -21,9 +15,29 @@ class PaymentSystemImpl(
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
     }
 
-    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        for (account in paymentAccounts) {
+    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): CompletableFuture<Boolean> {
+        val futures = paymentAccounts.map { account ->
             account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
         }
+
+        if (futures.isEmpty()) {
+            return CompletableFuture.completedFuture(false)
+        }
+
+        val result = CompletableFuture<Boolean>()
+        val remaining = AtomicInteger(futures.size)
+
+        futures.forEach { future ->
+            future.whenComplete { success, _ ->
+                if (success == true) {
+                    result.complete(true)
+                }
+                if (remaining.decrementAndGet() == 0) {
+                    result.complete(false)
+                }
+            }
+        }
+
+        return result
     }
 }
