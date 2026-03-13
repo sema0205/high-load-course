@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
+import io.micrometer.core.instrument.Timer
 import okhttp3.*
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.NonBlockingOngoingWindow
@@ -39,8 +40,6 @@ class PaymentExternalSystemAdapterImpl(
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
-    private val timeOut = Duration.ofSeconds(0)
-
     private val clients: List<OkHttpClient> = List(NUM_HTTP_CLIENTS) {
         val perClient = max(200, parallelRequests / 20)
         val exec = Executors.newFixedThreadPool(perClient)
@@ -68,24 +67,13 @@ class PaymentExternalSystemAdapterImpl(
 
     private val dbExecutor = Executors.newFixedThreadPool(DB_POOL_SIZE)
 
-    private val paymentAttemptsTotal: Counter = Counter.builder("payment_attempts_total")
-        .description("Payment attempts sent to provider")
+    private val requestCounter = Counter.builder("http_shop_payment_requests")
+        .description("Total number of requests sent by shop to payment service")
         .register(meterRegistry)
 
-    private val paymentSuccessTotal: Counter = Counter.builder("payment_success_total")
-        .description("Successfully processed payments")
-        .register(meterRegistry)
-
-    private val paymentFailureTotal: Counter = Counter.builder("payment_failure_total")
-        .description("Failed payments")
-        .register(meterRegistry)
-
-    private val paymentCompletedTotal: Counter = Counter.builder("payment_completed_total")
-        .description("Payments completed total")
-        .register(meterRegistry)
-
-    private val paymentTimeoutCounter: Counter = Counter.builder("payment_timeout_total")
-        .description("Total payment timeouts")
+    private val requestLatency = Timer.builder("payment_request_latency")
+        .description("Payment request latency with quantiles")
+        .publishPercentiles(0.5, 0.85, 0.99)
         .register(meterRegistry)
 
     override fun performPaymentAsync(
@@ -97,7 +85,8 @@ class PaymentExternalSystemAdapterImpl(
         val transactionId = UUID.randomUUID()
         val cf = CompletableFuture<Boolean>()
 
-        paymentAttemptsTotal.increment()
+        val requestStartTime = System.currentTimeMillis()
+        requestCounter.increment()
 
         if (ongoingWindow.putIntoWindow() is NonBlockingOngoingWindow.WindowResponse.Fail) {
             logger.debug("[$accountName] No free slot for payment $paymentId, rejecting")
@@ -144,11 +133,9 @@ class PaymentExternalSystemAdapterImpl(
             usedClient.newCall(request).enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
                     try {
-                        paymentFailureTotal.increment()
                         cf.complete(false)
 
                         if (e is SocketTimeoutException) {
-                            paymentTimeoutCounter.increment()
                             logger.error(
                                 "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e
                             )
@@ -173,8 +160,9 @@ class PaymentExternalSystemAdapterImpl(
                             }
                         }
                     } finally {
+                        val requestFinishTime = System.currentTimeMillis()
+                        requestLatency.record(requestFinishTime - requestStartTime, TimeUnit.MILLISECONDS)
                         releaseWindow()
-                        paymentCompletedTotal.increment()
                     }
                 }
 
@@ -189,7 +177,6 @@ class PaymentExternalSystemAdapterImpl(
                         val body = try {
                             mapper.readValue(bodyText, ExternalSysResponse::class.java)
                         } catch (e: Exception) {
-                            paymentFailureTotal.increment()
                             logger.error(
                                 "[$accountName] [ERROR] Payment processed for txId: $transactionId, " +
                                         "payment: $paymentId, result code: ${response.code}, reason: $bodyText", e
@@ -208,11 +195,6 @@ class PaymentExternalSystemAdapterImpl(
                         )
 
                         val result = body.result
-                        if (result) {
-                            paymentSuccessTotal.increment()
-                        } else {
-                            paymentFailureTotal.increment()
-                        }
 
                         cf.complete(result)
 
@@ -231,7 +213,6 @@ class PaymentExternalSystemAdapterImpl(
                         logger.error(
                             "[$accountName] Error processing response for txId: $transactionId, payment: $paymentId", e
                         )
-                        paymentFailureTotal.increment()
                         cf.complete(false)
 
                         dbExecutor.execute {
@@ -247,16 +228,13 @@ class PaymentExternalSystemAdapterImpl(
                         }
                     } finally {
                         releaseWindow()
-                        paymentCompletedTotal.increment()
                     }
                 }
             })
         } catch (e: Exception) {
-            paymentFailureTotal.increment()
 
             when (e) {
                 is SocketTimeoutException -> {
-                    paymentTimeoutCounter.increment()
                     logger.error(
                         "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e
                     )
@@ -281,7 +259,6 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             releaseWindow()
-            paymentCompletedTotal.increment()
         }
 
         return cf
