@@ -32,9 +32,6 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    // ──────────────────────────────────────────────
-    // Executor: CallerBlockingRejectedExecutionHandler чтобы не терять задачи
-    // ──────────────────────────────────────────────
     private val paymentExecutor = ScheduledThreadPoolExecutor(
         SUBMISSION_THREADS,
         NamedThreadFactory("payment-submission-executor")
@@ -45,14 +42,8 @@ class OrderPayer {
         setRemoveOnCancelPolicy(true)
     }
 
-    // ──────────────────────────────────────────────
-    // Отдельный пул для DB — не блокируем submission потоки
-    // ──────────────────────────────────────────────
     private val dbExecutor = Executors.newFixedThreadPool(100)
 
-    // ──────────────────────────────────────────────
-    // Admission rate limiter
-    // ──────────────────────────────────────────────
     private val admissionLimiter = LeakingBucketRateLimiter(
         rate = ADMISSION_RATE_PER_SEC,
         window = Duration.ofSeconds(1),
@@ -66,7 +57,6 @@ class OrderPayer {
             return null
         }
 
-        // DB-операцию создания выносим в отдельный пул — не блокируем submission
         dbExecutor.execute {
             try {
                 paymentESService.create {
@@ -95,7 +85,6 @@ class OrderPayer {
         val now = System.currentTimeMillis()
         val timeLeft = deadline - now
 
-        // Нет жёсткого safety margin — просто проверяем что время есть
         if (timeLeft <= 0) {
             logger.warn("Payment $paymentId attempt #$attempt aborted: deadline exceeded")
             return
@@ -116,7 +105,6 @@ class OrderPayer {
                         } else {
                             logger.debug("Payment $paymentId attempt #$attempt failed: ${error.message}")
                         }
-                        // Ретраим без ограничения на количество — только по deadline
                         scheduleRetry(paymentId, amount, createdAt, deadline, attempt)
                     }
                     success == true -> {
@@ -141,8 +129,6 @@ class OrderPayer {
         val timeLeft = deadline - now
         if (timeLeft <= 0) return
 
-        // Экспоненциальный backoff с jitter вместо фиксированных 25ms
-        // attempt=1 -> base=100, attempt=2 -> base=200, attempt=3 -> base=400, ... max=2000
         val baseBackoff = (100L shl (attempt - 1)).coerceAtMost(2000L)
         val jitter = ThreadLocalRandom.current().nextLong(0, baseBackoff + 1)
         val delayMs = minOf(baseBackoff + jitter, timeLeft)

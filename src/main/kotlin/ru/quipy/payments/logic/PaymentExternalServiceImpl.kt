@@ -125,34 +125,23 @@ class PaymentExternalSystemAdapterImpl(
         try {
             slidingWindowRateLimiter.tickBlocking()
 
-            val urlString = if (timeOut != Duration.ofSeconds(0)) {
-                "http://$paymentProviderHostPort/external/process" +
-                        "?timeout=$timeOut" +
-                        "&serviceName=$serviceName" +
-                        "&token=$token" +
-                        "&accountName=$accountName" +
-                        "&transactionId=$transactionId" +
-                        "&paymentId=$paymentId" +
-                        "&amount=$amount"
-            } else {
-                "http://$paymentProviderHostPort/external/process" +
+            val urlString = "http://$paymentProviderHostPort/external/process" +
                         "?serviceName=$serviceName" +
                         "&token=$token" +
                         "&accountName=$accountName" +
                         "&transactionId=$transactionId" +
                         "&paymentId=$paymentId" +
                         "&amount=$amount"
-            }
 
             val request = Request.Builder()
                 .url(urlString)
                 .post(emptyBody)
                 .build()
 
-            val idx = clientIndex.getAndIncrement()
-            val client = clients[(idx and Int.MAX_VALUE) % clients.size]
+            val clientIndex = clientIndex.getAndIncrement()
+            val usedClient = clients[(clientIndex and Int.MAX_VALUE) % clients.size]
 
-            client.newCall(request).enqueue(object : Callback {
+            usedClient.newCall(request).enqueue(object : Callback {
                 override fun onFailure(call: Call, e: IOException) {
                     try {
                         paymentFailureTotal.increment()
