@@ -16,6 +16,7 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.*
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.max
 
@@ -33,6 +34,8 @@ class PaymentExternalSystemAdapterImpl(
         val mapper = ObjectMapper().registerKotlinModule()
         const val NUM_HTTP_CLIENTS = 15
         const val DB_POOL_SIZE = 200
+        const val HEDGE_DELAY_MS = 200L
+        const val MAX_HEDGES = 3
     }
 
     private val serviceName = properties.serviceName
@@ -67,6 +70,8 @@ class PaymentExternalSystemAdapterImpl(
 
     private val dbExecutor = Executors.newFixedThreadPool(DB_POOL_SIZE)
 
+    private val hedgeScheduler = Executors.newScheduledThreadPool(4)
+
     private val requestCounter = Counter.builder("http_shop_payment_requests")
         .description("Total number of requests sent by shop to payment service")
         .register(meterRegistry)
@@ -84,8 +89,7 @@ class PaymentExternalSystemAdapterImpl(
     ): CompletableFuture<Boolean> {
         val transactionId = UUID.randomUUID()
         val cf = CompletableFuture<Boolean>()
-
-        val requestStartTime = System.currentTimeMillis()
+        val requestStartTime = now()
         requestCounter.increment()
 
         if (ongoingWindow.putIntoWindow() is NonBlockingOngoingWindow.WindowResponse.Fail) {
@@ -111,154 +115,125 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
-        try {
-            slidingWindowRateLimiter.tickBlocking()
+        val pendingHedges = AtomicInteger(MAX_HEDGES)
+        val resultLogged = AtomicBoolean(false)
+
+        fun logResult(success: Boolean, reason: String?) {
+            dbExecutor.execute {
+                try {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(success, now(), transactionId, reason = reason)
+                    }
+                } catch (e: Exception) {
+                    logger.error("[$accountName] Error updating ES for $paymentId", e)
+                }
+            }
+        }
+
+        fun finalize() {
+            if (pendingHedges.decrementAndGet() == 0) {
+                requestLatency.record(now() - requestStartTime, TimeUnit.MILLISECONDS)
+                releaseWindow()
+                if (cf.complete(false) && resultLogged.compareAndSet(false, true)) {
+                    logResult(false, "All hedged requests failed or were skipped")
+                }
+            }
+        }
+
+        fun sendHedge() {
+            if (cf.isDone) {
+                finalize()
+                return
+            }
+
+            if (!slidingWindowRateLimiter.tick()) {
+                finalize()
+                return
+            }
 
             val urlString = "http://$paymentProviderHostPort/external/process" +
-                        "?serviceName=$serviceName" +
-                        "&token=$token" +
-                        "&accountName=$accountName" +
-                        "&transactionId=$transactionId" +
-                        "&paymentId=$paymentId" +
-                        "&amount=$amount"
+                    "?serviceName=$serviceName" +
+                    "&token=$token" +
+                    "&accountName=$accountName" +
+                    "&transactionId=$transactionId" +
+                    "&paymentId=$paymentId" +
+                    "&amount=$amount"
 
             val request = Request.Builder()
                 .url(urlString)
                 .post(emptyBody)
                 .build()
 
-            val clientIndex = clientIndex.getAndIncrement()
-            val usedClient = clients[(clientIndex and Int.MAX_VALUE) % clients.size]
+            val idx = clientIndex.getAndIncrement()
+            val usedClient = clients[(idx and Int.MAX_VALUE) % clients.size]
 
-            usedClient.newCall(request).enqueue(object : Callback {
-                override fun onFailure(call: Call, e: IOException) {
-                    try {
-                        cf.complete(false)
-
-                        if (e is SocketTimeoutException) {
+            try {
+                usedClient.newCall(request).enqueue(object : Callback {
+                    override fun onFailure(call: Call, e: IOException) {
+                        try {
                             logger.error(
-                                "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e
+                                "[$accountName] Payment request failed for txId: $transactionId, payment: $paymentId", e
                             )
-                        } else {
-                            logger.error(
-                                "[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e
-                            )
+                        } finally {
+                            finalize()
                         }
+                    }
 
-                        dbExecutor.execute {
-                            try {
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(
-                                        false, now(), transactionId,
-                                        reason = if (e is SocketTimeoutException) "Request timeout." else e.message
-                                    )
-                                }
-                            } catch (u: Exception) {
+                    override fun onResponse(call: Call, response: Response) {
+                        try {
+                            val bodyText = try {
+                                response.body?.string()
+                            } catch (_: Exception) {
+                                null
+                            }
+
+                            val body = try {
+                                mapper.readValue(bodyText, ExternalSysResponse::class.java)
+                            } catch (e: Exception) {
                                 logger.error(
-                                    "[$accountName] Error updating ES on failure for payment $paymentId", u
+                                    "[$accountName] [ERROR] Payment processed for txId: $transactionId, " +
+                                            "payment: $paymentId, result code: ${response.code}, reason: $bodyText", e
+                                )
+                                ExternalSysResponse(
+                                    transactionId.toString(),
+                                    paymentId.toString(),
+                                    false,
+                                    e.message ?: bodyText
                                 )
                             }
-                        }
-                    } finally {
-                        val requestFinishTime = System.currentTimeMillis()
-                        requestLatency.record(requestFinishTime - requestStartTime, TimeUnit.MILLISECONDS)
-                        releaseWindow()
-                    }
-                }
 
-                override fun onResponse(call: Call, response: Response) {
-                    try {
-                        val bodyText = try {
-                            response.body?.string()
-                        } catch (_: Exception) {
-                            null
-                        }
+                            logger.debug(
+                                "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
+                                        "succeeded: ${body.result}, message: ${body.message}"
+                            )
 
-                        val body = try {
-                            mapper.readValue(bodyText, ExternalSysResponse::class.java)
+                            if (body.result && cf.complete(true) && resultLogged.compareAndSet(false, true)) {
+                                logResult(true, body.message)
+                            }
                         } catch (e: Exception) {
                             logger.error(
-                                "[$accountName] [ERROR] Payment processed for txId: $transactionId, " +
-                                        "payment: $paymentId, result code: ${response.code}, reason: $bodyText", e
+                                "[$accountName] Error processing response for txId: $transactionId, payment: $paymentId", e
                             )
-                            ExternalSysResponse(
-                                transactionId.toString(),
-                                paymentId.toString(),
-                                false,
-                                e.message ?: bodyText
-                            )
+                        } finally {
+                            finalize()
                         }
-
-                        logger.debug(
-                            "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, " +
-                                    "succeeded: ${body.result}, message: ${body.message}"
-                        )
-
-                        val result = body.result
-
-                        cf.complete(result)
-
-                        dbExecutor.execute {
-                            try {
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                                }
-                            } catch (u: Exception) {
-                                logger.error(
-                                    "[$accountName] Error updating ES on response for payment $paymentId", u
-                                )
-                            }
-                        }
-                    } catch (e: Exception) {
-                        logger.error(
-                            "[$accountName] Error processing response for txId: $transactionId, payment: $paymentId", e
-                        )
-                        cf.complete(false)
-
-                        dbExecutor.execute {
-                            try {
-                                paymentESService.update(paymentId) {
-                                    it.logProcessing(false, now(), transactionId, reason = e.message)
-                                }
-                            } catch (u: Exception) {
-                                logger.error(
-                                    "[$accountName] Error in exception handler for payment $paymentId", u
-                                )
-                            }
-                        }
-                    } finally {
-                        releaseWindow()
                     }
-                }
-            })
-        } catch (e: Exception) {
-
-            when (e) {
-                is SocketTimeoutException -> {
-                    logger.error(
-                        "[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e
-                    )
-                }
-                else -> {
-                    logger.error(
-                        "[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e
-                    )
-                }
+                })
+            } catch (e: Exception) {
+                logger.error("[$accountName] Error enqueueing request for $paymentId", e)
+                finalize()
             }
+        }
 
-            cf.complete(false)
+        sendHedge()
 
-            dbExecutor.execute {
-                try {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
-                    }
-                } catch (u: Exception) {
-                    logger.error("[$accountName] Error updating ES in outer catch for $paymentId", u)
-                }
+        for (i in 1 until MAX_HEDGES) {
+            val delayMs = i * HEDGE_DELAY_MS
+            if (deadline - now() > delayMs) {
+                hedgeScheduler.schedule({ sendHedge() }, delayMs, TimeUnit.MILLISECONDS)
+            } else {
+                finalize()
             }
-
-            releaseWindow()
         }
 
         return cf
