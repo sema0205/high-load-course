@@ -36,3 +36,4 @@ build/
 http-client.env.json
 grafana/data/
 prometheus/data/
+.env
