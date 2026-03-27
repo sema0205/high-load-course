@@ -2,6 +2,8 @@ package ru.quipy.payments.logic
 
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
+import io.github.resilience4j.circuitbreaker.CircuitBreaker
+import io.github.resilience4j.circuitbreaker.CircuitBreakerConfig
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
@@ -12,7 +14,6 @@ import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.io.IOException
-import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.*
@@ -42,6 +43,7 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
+    private val requestAverageProcessingTime = properties.averageProcessingTime
 
     private val clients: List<OkHttpClient> = List(NUM_HTTP_CLIENTS) {
         val perClient = max(200, parallelRequests / 20)
@@ -58,6 +60,20 @@ class PaymentExternalSystemAdapterImpl(
             .protocols(listOf(Protocol.H2_PRIOR_KNOWLEDGE))
             .build()
     }
+
+    private val circuitBreaker = CircuitBreaker.of(
+        accountName,
+        CircuitBreakerConfig.custom()
+            .slidingWindowType(CircuitBreakerConfig.SlidingWindowType.TIME_BASED)
+            .slidingWindowSize(10)
+            .failureRateThreshold(50f)
+            .slowCallRateThreshold(50f)
+            .slowCallDurationThreshold(requestAverageProcessingTime.multipliedBy(2))
+            .waitDurationInOpenState(Duration.ofSeconds(10))
+            .permittedNumberOfCallsInHalfOpenState(5)
+            .minimumNumberOfCalls(10)
+            .build()
+    )
 
     private val clientIndex = AtomicInteger(0)
 
@@ -92,8 +108,27 @@ class PaymentExternalSystemAdapterImpl(
         val requestStartTime = now()
         requestCounter.increment()
 
+        if (!circuitBreaker.tryAcquirePermission()) {
+            logger.warn("[$accountName] Circuit breaker OPEN, rejecting $paymentId")
+            dbExecutor.execute {
+                try {
+                    paymentESService.update(paymentId) {
+                        it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+                    }
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "Circuit breaker is OPEN")
+                    }
+                } catch (e: Exception) {
+                    logger.error("[$accountName] Error logging CB rejection for $paymentId", e)
+                }
+            }
+            cf.complete(false)
+            return cf
+        }
+
         if (ongoingWindow.putIntoWindow() is NonBlockingOngoingWindow.WindowResponse.Fail) {
             logger.debug("[$accountName] No free slot for payment $paymentId, rejecting")
+            circuitBreaker.releasePermission()
             cf.complete(false)
             return cf
         }
@@ -117,6 +152,7 @@ class PaymentExternalSystemAdapterImpl(
 
         val pendingHedges = AtomicInteger(MAX_HEDGES)
         val resultLogged = AtomicBoolean(false)
+        val cbReported = AtomicBoolean(false)
 
         fun logResult(success: Boolean, reason: String?) {
             dbExecutor.execute {
@@ -130,7 +166,18 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
-        fun finalize() {
+        fun reportCb(success: Boolean, durationMs: Long, error: Exception? = null) {
+            if (cbReported.compareAndSet(false, true)) {
+                if (success) {
+                    circuitBreaker.onSuccess(durationMs, TimeUnit.MILLISECONDS)
+                } else {
+                    circuitBreaker.onError(durationMs, TimeUnit.MILLISECONDS, error ?: RuntimeException("failed"))
+                }
+            }
+        }
+
+        fun finalize(callSuccess: Boolean, durationMs: Long, error: Exception? = null) {
+            reportCb(callSuccess, durationMs, error)
             if (pendingHedges.decrementAndGet() == 0) {
                 requestLatency.record(now() - requestStartTime, TimeUnit.MILLISECONDS)
                 releaseWindow()
@@ -142,14 +189,16 @@ class PaymentExternalSystemAdapterImpl(
 
         fun sendHedge() {
             if (cf.isDone) {
-                finalize()
+                pendingHedges.decrementAndGet()
                 return
             }
 
             if (!slidingWindowRateLimiter.tick()) {
-                finalize()
+                finalize(false, 0, RuntimeException("Rate limit exceeded"))
                 return
             }
+
+            val hedgeStart = now()
 
             val urlString = "http://$paymentProviderHostPort/external/process" +
                     "?serviceName=$serviceName" +
@@ -175,11 +224,12 @@ class PaymentExternalSystemAdapterImpl(
                                 "[$accountName] Payment request failed for txId: $transactionId, payment: $paymentId", e
                             )
                         } finally {
-                            finalize()
+                            finalize(false, now() - hedgeStart, e)
                         }
                     }
 
                     override fun onResponse(call: Call, response: Response) {
+                        var callSuccess = false
                         try {
                             val bodyText = try {
                                 response.body?.string()
@@ -207,6 +257,7 @@ class PaymentExternalSystemAdapterImpl(
                                         "succeeded: ${body.result}, message: ${body.message}"
                             )
 
+                            callSuccess = body.result
                             if (body.result && cf.complete(true) && resultLogged.compareAndSet(false, true)) {
                                 logResult(true, body.message)
                             }
@@ -215,13 +266,13 @@ class PaymentExternalSystemAdapterImpl(
                                 "[$accountName] Error processing response for txId: $transactionId, payment: $paymentId", e
                             )
                         } finally {
-                            finalize()
+                            finalize(callSuccess, now() - hedgeStart)
                         }
                     }
                 })
             } catch (e: Exception) {
                 logger.error("[$accountName] Error enqueueing request for $paymentId", e)
-                finalize()
+                finalize(false, now() - hedgeStart, e)
             }
         }
 
@@ -232,7 +283,7 @@ class PaymentExternalSystemAdapterImpl(
             if (deadline - now() > delayMs) {
                 hedgeScheduler.schedule({ sendHedge() }, delayMs, TimeUnit.MILLISECONDS)
             } else {
-                finalize()
+                pendingHedges.decrementAndGet()
             }
         }
 
